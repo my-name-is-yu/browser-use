@@ -3,7 +3,9 @@
 import argparse
 import asyncio
 import hashlib
+import importlib.metadata
 import json
+import platform
 import subprocess
 from pathlib import Path
 from typing import Literal
@@ -14,6 +16,7 @@ from benchmarks.bu_fast.measure_goal_loop import ExperimentSettings, execute_tri
 from benchmarks.bu_fast.validate_evaluation import CHROME, REPO, configure_project_environment
 
 VARIANTS = ('baseline', 'advice', 'experience', 'parallel', 'parallel-serial')
+DEFAULT_PYTHON = Path('/Users/yuyoshimuta/.codex/worktrees/65e8/bu-fast/.venv/bin/python')
 DEFAULT_WORKTREES = {
 	'baseline': REPO,
 	'advice': Path('/Users/yuyoshimuta/.codex/worktrees/2a4f/bu-fast'),
@@ -46,6 +49,8 @@ class Protocol(BaseModel):
 	env_file: Path
 	upstream: Path
 	memo_preparation: list[dict]
+	python_executable: Path = DEFAULT_PYTHON
+	runtime_fingerprint: dict = Field(default_factory=dict)
 	limits: dict = Field(
 		default_factory=lambda: {
 			'task_seconds': 240,
@@ -57,6 +62,18 @@ class Protocol(BaseModel):
 			'interpretation': 'API surrogate; exposed tasks, not held-out adoption evidence. Parallel vs serial is the concurrency control; queue admission can differ and must be reported.',
 		}
 	)
+
+
+def python_command(executable: Path, *arguments: str) -> list[str]:
+	"""Use one unchanged environment while importing source from each trial cwd."""
+	return ['uv', 'run', '--no-project', '--python', str(executable), 'python', *arguments]
+
+
+def runtime_fingerprint() -> dict:
+	return {
+		'python': platform.python_version(),
+		'packages': {name: importlib.metadata.version(name) for name in ('pydantic', 'httpx', 'openai', 'cdp-use')},
+	}
 
 
 def digest(path: Path) -> str:
@@ -88,16 +105,24 @@ def prepare(args) -> Path:
 	upstream = args.upstream.resolve()
 	sources = {}
 	commits = {}
+	fingerprint = json.loads(
+		subprocess.check_output(
+			python_command(
+				args.python_executable,
+				'-c',
+				'import json; from benchmarks.bu_fast.measure_architectures import runtime_fingerprint; print(json.dumps(runtime_fingerprint()))',
+			),
+			cwd=REPO,
+			text=True,
+		)
+	)
 	for variant, checkout in DEFAULT_WORKTREES.items():
 		result = subprocess.run(
-			[
-				'uv',
-				'run',
-				'--no-sync',
-				'python',
+			python_command(
+				args.python_executable,
 				'-c',
 				'from pathlib import Path; import browser_use.fast.session as s; print(Path(s.__file__).resolve())',
-			],
+			),
 			cwd=checkout,
 			capture_output=True,
 			text=True,
@@ -124,16 +149,13 @@ def prepare(args) -> Path:
 		raise ValueError('Freeze explicit memo IDs for every development task')
 	# Validate through the experience checkout, without opening a browser or model request.
 	subprocess.run(
-		[
-			'uv',
-			'run',
-			'--no-sync',
-			'python',
+		python_command(
+			args.python_executable,
 			'-c',
 			'import json,sys; from pathlib import Path; from browser_use.fast.experience import load_memos; [load_memos(Path(sys.argv[1]), ids) for ids in json.loads(Path(sys.argv[2]).read_text()).values()]',
 			str(args.memo_store.resolve()),
 			str(args.memo_selection.resolve()),
-		],
+		),
 		cwd=DEFAULT_WORKTREES['experience'],
 		check=True,
 	)
@@ -177,6 +199,8 @@ def prepare(args) -> Path:
 		env_file=args.env_file.resolve(),
 		upstream=upstream,
 		memo_preparation=memo_preparation,
+		python_executable=args.python_executable,
+		runtime_fingerprint=fingerprint,
 	)
 	for source in sources:
 		target = output / 'source-snapshot' / source.lstrip('/')
@@ -189,6 +213,8 @@ def prepare(args) -> Path:
 async def trial(path: Path, index: int):
 	protocol = Protocol.model_validate_json(path.read_text())
 	validate_frozen(protocol)
+	if runtime_fingerprint() != protocol.runtime_fingerprint:
+		raise ValueError('Trial interpreter or dependencies differ from the frozen runtime')
 	cell = protocol.order[index]
 	if REPO != cell.checkout:
 		raise ValueError('Trial must run from its own frozen worktree')
@@ -204,6 +230,7 @@ async def trial(path: Path, index: int):
 
 def main():
 	parser = argparse.ArgumentParser(description=__doc__)
+	parser.add_argument('--python-executable', type=Path, default=DEFAULT_PYTHON)
 	parser.add_argument('--output', type=Path)
 	parser.add_argument('--protocol', type=Path)
 	parser.add_argument('--upstream', type=Path, default=Path('/private/tmp/bu-fast-upstream-bench-v2.1.1'))
@@ -233,18 +260,15 @@ def main():
 		for index, cell in enumerate(protocol.order):
 			validate_frozen(protocol)
 			subprocess.run(
-				[
-					'uv',
-					'run',
-					'--no-sync',
-					'python',
+				python_command(
+					protocol.python_executable,
 					'-m',
 					'benchmarks.bu_fast.measure_architectures',
 					'--protocol',
 					str(path),
 					'--trial',
 					str(index),
-				],
+				),
 				cwd=cell.checkout,
 				check=True,
 			)
