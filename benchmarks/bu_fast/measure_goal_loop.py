@@ -58,6 +58,19 @@ class AuditedTransport(MeteredTransport):
 		return response
 
 
+class ExperimentSettings(BaseModel):
+	"""One isolated addition; all model and total task budgets remain shared."""
+
+	variant: Literal['baseline', 'advice', 'experience', 'parallel', 'parallel-serial'] = 'baseline'
+	max_advice_requests: int = Field(default=2, ge=1, le=3)
+	memo_store: Path | None = None
+	memo_ids: list[str] = Field(default_factory=list, max_length=5)
+
+
+class SupplyAdvice(BaseModel):
+	text: str = Field(min_length=1, max_length=1000)
+
+
 class ResumeBrowser(BaseModel):
 	inputs: list[str] = Field(min_length=1, max_length=20)
 
@@ -89,9 +102,16 @@ class TrialMetrics(BaseModel):
 	requests: list[dict] = Field(default_factory=list)
 	settlement_seconds: float = 0
 	cleanup_seconds: float = 0
+	experiment: str = 'baseline'
+	advice_calls: int = 0
+	parent_preparation_requests: int = 0
+	parallel_result: dict | None = None
+	wall_seconds: float = 0
+	browser_loop_seconds: float | None = None
+	parent_overlap_seconds: float = 0
 
 
-def tools(arm):
+def tools(arm, experiment=None):
 	from browser_use.llm.schema import SchemaOptimizer
 
 	result = common.browser_tools(False)
@@ -101,6 +121,14 @@ def tools(arm):
 	]
 	if arm == 'goal':
 		extra.append(('resume_browser', 'Supply exact new text to a needs_input run on the same browser.', ResumeBrowser))
+	if experiment and experiment.variant == 'advice':
+		extra.append(
+			(
+				'supply_advice',
+				'Interpret saved evidence and give brief direction to a needs_advice run; no selectors, input values or action sequence.',
+				SupplyAdvice,
+			)
+		)
 	for name, description, schema in extra:
 		result.append(
 			{
@@ -137,7 +165,8 @@ def evidence_item(o):
 	}
 
 
-async def execute_trial(task, arm, repeat, directory):
+async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSettings | None = None):
+	experiment = experiment or ExperimentSettings()
 	directory.mkdir(parents=True)
 	(directory / 'outputs').mkdir()
 	(directory / 'screenshots').mkdir()
@@ -164,7 +193,7 @@ async def execute_trial(task, arm, repeat, directory):
 	)
 	trace = Trace(final_result='', agent_steps=[], screenshots_b64=[], screenshot_steps=[])
 	observed = []
-	metrics = TrialMetrics(task=task['id'], arm=arm, repeat=repeat)
+	metrics = TrialMetrics(task=task['id'], arm=arm, repeat=repeat, experiment=experiment.variant)
 	began = time.monotonic()
 	deadline = began + 240
 	runtime = None
@@ -172,6 +201,10 @@ async def execute_trial(task, arm, repeat, directory):
 	operation_trace = None
 	delegation_trace = None
 	receipts = {}
+	parent_starts = {}
+	browser_intervals = []
+	parent_intervals = []
+	delegate_began = 0.0
 
 	async def snapshot(driver):
 		o = (await driver.observe()).model_dump(exclude={'screenshot'})
@@ -185,13 +218,48 @@ async def execute_trial(task, arm, repeat, directory):
 		if data['event'] == 'observed':
 			observed.append(data['observation'])
 			await capture(page, {'goal_observation': True}, data['observation'])
+		elif data['event'] == 'result':
+			metrics.browser_loop_seconds = time.monotonic() - began
+			browser_intervals.append((delegate_began, data.get('at', time.time())))
+		elif data['event'].startswith('parent_'):
+			trace.agent_steps.append(json.dumps(data, ensure_ascii=False))
+			if data['event'] == 'parent_started':
+				metrics.parent_preparation_requests += 1
+				parent_starts[data['request_id']] = data.get('at', time.time())
+			elif data['event'] in ('parent_returned', 'parent_cancelled', 'parent_error') and data['request_id'] in parent_starts:
+				parent_intervals.append((parent_starts.pop(data['request_id']), data.get('at', time.time())))
 		elif data['event'] == 'receipt':
 			if data['receipt']['status'] == 'returned':
 				metrics.browser_actions += 1
 			trace.agent_steps.append(json.dumps(data, ensure_ascii=False))
 
-	async def delegate(resume=None, inputs=None):
-		nonlocal runtime, last, delegation_trace
+	async def delegate(resume=None, inputs=None, advice=None):
+		nonlocal runtime, last, delegation_trace, delegate_began
+		delegate_began = time.time()
+		options = {}
+		run_options = {}
+		if experiment.variant == 'advice':
+			options['max_advice_requests'] = experiment.max_advice_requests
+			if advice is not None:
+				Advice = getattr(importlib.import_module('browser_use.fast.views'), 'Advice')
+
+				run_options['advice'] = Advice(text=advice)
+		if experiment.variant == 'experience' and resume is None:
+			load_memos = getattr(importlib.import_module('browser_use.fast.experience'), 'load_memos')
+
+			if not experiment.memo_store or not experiment.memo_ids:
+				raise ValueError('Experience comparison requires frozen nonempty memo IDs')
+			run_options['experience'] = load_memos(experiment.memo_store, experiment.memo_ids)
+		if experiment.variant in ('parallel', 'parallel-serial'):
+			parallel_module = importlib.import_module('browser_use.fast.parallel')
+			APIParentReader, ParallelEvidence = parallel_module.APIParentReader, parallel_module.ParallelEvidence
+
+			options['parallel_evidence'] = ParallelEvidence(
+				APIParentReader(parent),
+				max_requests=4,
+				concurrent=experiment.variant == 'parallel',
+				deadline_at=time.time() + max(0, deadline - time.monotonic()),
+			)
 		runtime = DecisionRuntime(
 			browser,
 			target_id=browser.agent_focus_target_id,
@@ -200,11 +268,13 @@ async def execute_trial(task, arm, repeat, directory):
 			max_decisions=60,
 			output_dir=directory / 'runs',
 			on_event=event,
+			**options,
 		)
 		last = await runtime.run(
 			BrowserTask(url=task['start_url'], goal=task['goal'], inputs=task['exact_input_values']) if resume is None else None,
 			resume=resume,
 			inputs=inputs,
+			**run_options,
 		)
 		metrics.handoffs.append(last.reason)
 		if last.status != 'done':
@@ -212,7 +282,13 @@ async def execute_trial(task, arm, repeat, directory):
 		metrics.delegate_seconds = time.monotonic() - began
 		metrics.delegate_status = last.status
 		delegation_trace = trace.model_copy(deep=True)
-		return last.summary()
+		summary = last.summary()
+		if experiment.variant in ('parallel', 'parallel-serial'):
+			manifest = Path(last.directory) / 'parallel/result.json'
+			if manifest.exists():
+				metrics.parallel_result = json.loads(manifest.read_text())
+				summary['provisional_preparation'] = metrics.parallel_result
+		return summary
 
 	try:
 		await browser.start()
@@ -233,8 +309,21 @@ async def execute_trial(task, arm, repeat, directory):
 			]
 
 		initial = {'browser': initial, 'evidence_index': evidence_index()}
+		if experiment.variant in ('parallel', 'parallel-serial') and last:
+			manifest = Path(last.directory) / 'parallel/result.json'
+			if manifest.exists():
+				metrics.parallel_result = json.loads(manifest.read_text())
+				initial['provisional_preparation'] = metrics.parallel_result
 		messages = [
-			{'role': 'system', 'content': PARENT_POLICY},
+			{
+				'role': 'system',
+				'content': PARENT_POLICY
+				+ (
+					'\nOn needs_advice inspect saved observations and recent operation receipts, then supply_advice to continue the SAME goal. Advice must be natural language interpretation/direction only. Prefer this to taking over browser actions. Handoff time and calls count toward total budgets.'
+					if experiment.variant == 'advice'
+					else ''
+				),
+			},
 			{
 				'role': 'user',
 				'content': task['goal']
@@ -246,6 +335,9 @@ async def execute_trial(task, arm, repeat, directory):
 		metrics.tool_return_bytes += len(json.dumps(initial, ensure_ascii=False).encode())
 		(directory / 'initial-parent-input.json').write_text(json.dumps(messages, ensure_ascii=False))
 		for turn in range(12):
+			if sum(r.role == 'parent' for r in requests) >= 12:
+				metrics.error = 'Shared parent request budget exhausted'
+				break
 			remaining = deadline - time.monotonic()
 			if remaining <= 0:
 				raise TimeoutError('Task deadline reached')
@@ -262,7 +354,7 @@ async def execute_trial(task, arm, repeat, directory):
 					reasoning={'effort': 'xhigh'},
 					service_tier='default',
 					max_output_tokens=8192,
-					tools=tools(arm),
+					tools=tools(arm, experiment),
 					input=messages,
 					parallel_tool_calls=False,
 					store=False,
@@ -289,6 +381,12 @@ async def execute_trial(task, arm, repeat, directory):
 
 			async def handle(call):
 				nonlocal operation_trace
+				if call.name == 'supply_advice':
+					if not last or last.status != 'needs_advice':
+						raise ValueError('No saved advice handoff')
+					data = SupplyAdvice.model_validate_json(call.arguments)
+					metrics.advice_calls += 1
+					return await delegate(last, advice=data.text)
 				if call.name == 'resume_browser':
 					if not last:
 						raise ValueError('No saved run')
@@ -394,7 +492,8 @@ async def execute_trial(task, arm, repeat, directory):
 		metrics.status, metrics.error = 'timeout', 'Task deadline reached'
 	except Exception as e:
 		metrics.error = f'{type(e).__name__}: {e}'
-	metrics.seconds = min(time.monotonic() - began - metrics.settlement_seconds, 240)
+	metrics.wall_seconds = time.monotonic() - began
+	metrics.seconds = metrics.wall_seconds - metrics.settlement_seconds
 	for name, receipt in receipts.items():
 		content, gap = common.collect_artifact(receipt)
 		if gap:
@@ -408,6 +507,9 @@ async def execute_trial(task, arm, repeat, directory):
 		if value:
 			(directory / (name + '.json')).write_text(value.model_dump_json())
 	(directory / 'observations.json').write_text(json.dumps(observed, ensure_ascii=False))
+	metrics.parent_overlap_seconds = sum(
+		max(0, min(pe, be) - max(ps, bs)) for ps, pe in parent_intervals for bs, be in browser_intervals
+	)
 	metrics.requests = [r.model_dump() for r in requests]
 	cleanup = time.monotonic()
 	await parent.close()
