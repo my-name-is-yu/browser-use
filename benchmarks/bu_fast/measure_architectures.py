@@ -117,6 +117,7 @@ def prepare(args) -> Path:
 		raise ValueError('Configured Chrome executable missing')
 	if not args.env_file.is_file():
 		raise ValueError('Explicit environment file missing')
+	configure_project_environment(args.env_file)
 	sources[str(args.memo_selection.resolve())] = digest(args.memo_selection)
 	selection = json.loads(args.memo_selection.read_text())
 	if set(selection) != {t['id'] for t in load_tasks()}:

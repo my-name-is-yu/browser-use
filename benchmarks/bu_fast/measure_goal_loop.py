@@ -309,11 +309,6 @@ async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSett
 			]
 
 		initial = {'browser': initial, 'evidence_index': evidence_index()}
-		if experiment.variant in ('parallel', 'parallel-serial') and last:
-			manifest = Path(last.directory) / 'parallel/result.json'
-			if manifest.exists():
-				metrics.parallel_result = json.loads(manifest.read_text())
-				initial['provisional_preparation'] = metrics.parallel_result
 		messages = [
 			{
 				'role': 'system',
@@ -365,7 +360,8 @@ async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSett
 				response = await asyncio.wait_for(asyncio.shield(pending), remaining)
 			except TimeoutError:
 				settle = time.monotonic()
-				await pending
+				pending.cancel()
+				await asyncio.gather(pending, return_exceptions=True)
 				metrics.settlement_seconds = time.monotonic() - settle
 				raise
 			(directory / f'parent-{turn:02d}.json').write_text(response.model_dump_json())
