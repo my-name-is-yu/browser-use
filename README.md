@@ -1,3 +1,5 @@
+> **bu-fast fork:** Codex supplies a goal; OpenAI Decisions runs the browser loop and returns to Codex only when new input text is needed. Start with [BU_FAST.md](BU_FAST.md) and [the Codex Skill](skills/bu-fast/SKILL.md). The upstream Browser Use documentation follows.
+
 <!-- mcp-name: com.browser-use/browser-use -->
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="https://github.com/user-attachments/assets/2ccdb752-22fb-41c7-8948-857fc1ad7e24">

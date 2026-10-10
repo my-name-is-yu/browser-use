@@ -102,6 +102,7 @@ Telemetry = "https://docs.browser-use.com/development/monitoring/telemetry"
 "Privacy Policy" = "https://browser-use.com/privacy/"
 
 [project.scripts]
+bu-fast = "browser_use.fast.cli:main"
 browser-use = "browser_use.cli:main"  # Browser Use CLI for agents
 browseruse = "browser_use.cli:main"  # Alias for browser-use
 bu = "browser_use.cli:main"  # Alias for browser-use

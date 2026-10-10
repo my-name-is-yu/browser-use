@@ -493,6 +493,8 @@ class AgentHistory(BaseModel):
 	state: BrowserStateHistory
 	metadata: StepMetadata | None = None
 	state_message: str | None = None
+	action_source: Literal['model', 'code', 'decisions'] = 'model'
+	supplied_actions: list[dict[str, Any]] | None = None
 
 	model_config = ConfigDict(arbitrary_types_allowed=True, protected_namespaces=())
 
@@ -581,6 +583,8 @@ class AgentHistory(BaseModel):
 			'state': self.state.to_dict(),
 			'metadata': self.metadata.model_dump() if self.metadata else None,
 			'state_message': self.state_message,
+			'action_source': self.action_source,
+			'supplied_actions': self._filter_sensitive_data_from_value(self.supplied_actions, sensitive_data),
 		}
 
 

@@ -36,6 +36,7 @@ from pydantic import BaseModel, ValidationError
 from uuid_extensions import uuid7str
 
 from browser_use import Browser, BrowserProfile, BrowserSession
+from browser_use.agent.execution import BatchExecution, capture_browser_state, execute_action_batch, make_execution_history
 from browser_use.agent.judge import construct_judge_messages
 
 # Lazy import for gif to avoid heavy agent.views import at startup
@@ -1093,7 +1094,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.logger.debug(f'🌐 Step {self.state.n_steps}: Getting browser state...')
 		# Always take screenshots for all steps
 		self.logger.debug('📸 Requesting browser state with include_screenshot=True')
-		browser_state_summary = await self.browser_session.get_browser_state_summary(
+		browser_state_summary = await capture_browser_state(
+			self.browser_session,
 			include_screenshot=True,  # always capture even if use_vision=False so that cloud sync is useful (it's fast now anyway)
 			include_recent_events=self.include_recent_events,
 		)
@@ -1281,7 +1283,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				# Check if reconnection succeeded
 				if self.browser_session.is_cdp_connected:
 					self.logger.info('🔄 Reconnection succeeded, retrying step...')
-					self.state.last_result = [ActionResult(error=f'Connection lost and recovered: {error}')]
+					self.state.last_result = [
+						*(self.state.last_result or []),
+						ActionResult(error=f'Connection lost and recovered: {error}'),
+					]
 					return
 
 			# Not reconnecting or reconnection failed — check if truly terminal
@@ -1310,7 +1315,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.log(log_level, f'{prefix}{error_msg}')
 
 		await self._demo_mode_log(f'Step error: {error_msg}', 'error', {'step': self.state.n_steps})
-		self.state.last_result = [ActionResult(error=error_msg)]
+		self.state.last_result = [*(self.state.last_result or []), ActionResult(error=error_msg)]
 		return None
 
 	def _is_connection_like_error(self, error: Exception) -> bool:
@@ -1743,40 +1748,17 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		metadata: StepMetadata | None = None,
 		state_message: str | None = None,
 	) -> None:
-		"""Create and store history item"""
-
-		if model_output:
-			interacted_elements = AgentHistory.get_interacted_element(model_output, browser_state_summary.dom_state.selector_map)
-		else:
-			interacted_elements = [None]
-
-		# Store screenshot and get path
-		screenshot_path = None
-		if browser_state_summary.screenshot:
-			self.logger.debug(
-				f'📸 Storing screenshot for step {self.state.n_steps}, screenshot length: {len(browser_state_summary.screenshot)}'
-			)
-			screenshot_path = await self.screenshot_service.store_screenshot(browser_state_summary.screenshot, self.state.n_steps)
-			self.logger.debug(f'📸 Screenshot stored at: {screenshot_path}')
-		else:
-			self.logger.debug(f'📸 No screenshot in browser_state_summary for step {self.state.n_steps}')
-
-		state_history = BrowserStateHistory(
-			url=browser_state_summary.url,
-			title=browser_state_summary.title,
-			tabs=browser_state_summary.tabs,
-			interacted_element=interacted_elements,
-			screenshot_path=screenshot_path,
-		)
-
-		history_item = AgentHistory(
+		"""Create and store history using the shared browser execution recorder."""
+		history_item = await make_execution_history(
+			model_output.action if model_output else [],
+			browser_state_summary,
+			result,
+			self.screenshot_service,
+			metadata,
 			model_output=model_output,
-			result=result,
-			state=state_history,
-			metadata=metadata,
 			state_message=state_message,
+			step_number=self.state.n_steps,
 		)
-
 		self.history.add_item(history_item)
 
 	def _remove_think_tags(self, text: str) -> str:
@@ -2472,7 +2454,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.error(f'⏰ {error_msg}')
 			await self._demo_mode_log(error_msg, 'error', {'step': step + 1})
 			self.state.consecutive_failures += 1
-			self.state.last_result = [ActionResult(error=error_msg)]
+			self.state.last_result = [*(self.state.last_result or []), ActionResult(error=error_msg)]
 			# Ensure step counter advances on timeout — _finalize() may have
 			# been skipped or returned early due to the cancellation.
 			if self.state.n_steps == step + 1:
@@ -2728,124 +2710,44 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 	@observe_debug(ignore_input=True, ignore_output=True)
 	@time_execution_async('--multi_act')
 	async def multi_act(self, actions: list[ActionModel]) -> list[ActionResult]:
-		"""Execute multiple actions with page-change guards.
-
-		Two layers of protection prevent executing actions against stale DOM:
-		  1. Static flag: actions tagged with terminates_sequence=True (navigate, search, go_back, switch)
-		     automatically abort remaining queued actions.
-		  2. Runtime detection: after every action, the current URL and focused target are compared
-		     to pre-action values. Any change aborts the remaining queue.
-		"""
-		results: list[ActionResult] = []
-		total_actions = len(actions)
-
+		"""Execute through the shared kernel, preserving a prefix even if interrupted."""
 		assert self.browser_session is not None, 'BrowserSession is not set up'
-		try:
-			if (
-				self.browser_session._cached_browser_state_summary is not None
-				and self.browser_session._cached_browser_state_summary.dom_state is not None
-			):
-				cached_selector_map = dict(self.browser_session._cached_browser_state_summary.dom_state.selector_map)
-			else:
-				cached_selector_map = {}
-		except Exception as e:
-			self.logger.error(f'Error getting cached selector map: {e}')
-			cached_selector_map = {}
+		report = BatchExecution()
 
-		for i, action in enumerate(actions):
-			# Get action name from the action model BEFORE try block to ensure it's always available in except
-			action_data = action.model_dump(exclude_unset=True)
-			action_name = next(iter(action_data.keys())) if action_data else 'unknown'
+		def record_progress(receipt) -> None:
+			self.state.last_result = report.results
 
-			if i > 0:
-				# ONLY ALLOW TO CALL `done` IF IT IS A SINGLE ACTION
-				if action_data.get('done') is not None:
-					msg = f'Done action is allowed only as a single action - stopped after action {i} / {total_actions}.'
-					self.logger.debug(msg)
-					break
-
-			# wait between actions (only after first action)
-			if i > 0:
-				self.logger.debug(f'Waiting {self.browser_profile.wait_between_actions} seconds between actions')
-				await asyncio.sleep(self.browser_profile.wait_between_actions)
-
-			try:
-				await self._check_stop_or_pause()
-
-				# Log action before execution
-				await self._log_action(action, action_name, i + 1, total_actions)
-
-				# Capture pre-action state for runtime page-change detection
-				pre_action_url = await self.browser_session.get_current_page_url()
-				pre_action_focus = self.browser_session.agent_focus_target_id
-
-				result = await self.tools.act(
-					action=action,
-					browser_session=self.browser_session,
-					file_system=self.file_system,
-					page_extraction_llm=self.settings.page_extraction_llm,
-					sensitive_data=self.sensitive_data,
-					available_file_paths=self.available_file_paths,
-					extraction_schema=self.extraction_schema,
-				)
-
-				if result.error:
-					await self._demo_mode_log(
-						f'Action "{action_name}" failed: {result.error}',
-						'error',
-						{'action': action_name, 'step': self.state.n_steps},
-					)
-				elif result.is_done:
-					completion_text = result.long_term_memory or result.extracted_content or 'Task marked as done.'
-					level = 'success' if result.success is not False else 'warning'
-					await self._demo_mode_log(
-						completion_text,
-						level,
-						{'action': action_name, 'step': self.state.n_steps},
-					)
-
-				results.append(result)
-
-				if results[-1].is_done or results[-1].error or i == total_actions - 1:
-					break
-
-				# --- Page-change guards (only when more actions remain) ---
-
-				# Layer 1: Static flag — action metadata declares it changes the page
-				registered_action = self.tools.registry.registry.actions.get(action_name)
-				if registered_action and registered_action.terminates_sequence:
-					self.logger.info(
-						f'Action "{action_name}" terminates sequence — skipping {total_actions - i - 1} remaining action(s)'
-					)
-					break
-
-				# Layer 2: Runtime detection — URL or focus target changed
-				post_action_url = await self.browser_session.get_current_page_url()
-				post_action_focus = self.browser_session.agent_focus_target_id
-
-				if post_action_url != pre_action_url or post_action_focus != pre_action_focus:
-					self.logger.info(f'Page changed after "{action_name}" — skipping {total_actions - i - 1} remaining action(s)')
-					break
-
-			except Exception as e:
-				# Re-raise InterruptedError so _check_stop_or_pause's stop/pause signal still propagates
-				if isinstance(e, InterruptedError):
-					raise
-				# Re-raise browser/connection errors so _handle_step_error can handle reconnect/shutdown
-				if self._is_connection_like_error(e):
-					raise
-				# Handle any exceptions during action execution
-				self.logger.error(f'❌ Executing action {i + 1} failed -> {type(e).__name__}: {e}')
+		async def log_result(action_name: str, result: ActionResult) -> None:
+			if result.error:
 				await self._demo_mode_log(
-					f'Action "{action_name}" raised {type(e).__name__}: {e}',
-					'error',
+					f'Action "{action_name}" failed: {result.error}', 'error', {'action': action_name, 'step': self.state.n_steps}
+				)
+			elif result.is_done:
+				await self._demo_mode_log(
+					result.long_term_memory or result.extracted_content or 'Task marked as done.',
+					'success' if result.success is not False else 'warning',
 					{'action': action_name, 'step': self.state.n_steps},
 				)
-				# Preserve partial results so the agent knows which actions succeeded before the failure
-				results.append(ActionResult(error=f'{type(e).__name__}: {e}'))
-				return results
 
-		return results
+		await execute_action_batch(
+			actions,
+			self.browser_session,
+			self.tools,
+			tool_kwargs={
+				'file_system': self.file_system,
+				'page_extraction_llm': self.settings.page_extraction_llm,
+				'sensitive_data': self.sensitive_data,
+				'available_file_paths': self.available_file_paths,
+				'extraction_schema': self.extraction_schema,
+			},
+			check_stop=self._check_stop_or_pause,
+			progress=record_progress,
+			log_action=self._log_action,
+			on_result=log_result,
+			raise_connection_errors=True,
+			report=report,
+		)
+		return report.results
 
 	async def _log_action(self, action, action_name: str, action_num: int, total_actions: int) -> None:
 		"""Log the action before execution with colored formatting"""

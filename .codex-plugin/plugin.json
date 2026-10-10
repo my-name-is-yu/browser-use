@@ -1,0 +1,6 @@
+{
+  "name": "bu-fast",
+  "version": "0.2.0",
+  "description": "Codex supplies a goal; Decisions chooses browser operations and returns to Codex when new input text is needed.",
+  "skills": "./skills/"
+}

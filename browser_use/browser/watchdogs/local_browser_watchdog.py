@@ -84,6 +84,8 @@ class LocalBrowserWatchdog(BaseWatchdog):
 
 	async def on_BrowserStopEvent(self, event: BrowserStopEvent) -> None:
 		"""Listen for BrowserStopEvent and dispatch BrowserKillEvent without awaiting it."""
+		if self.browser_session.browser_profile.keep_alive and not event.force:
+			return
 		if self.browser_session.is_local and self._subprocess:
 			self.logger.debug('[LocalBrowserWatchdog] BrowserStopEvent received, dispatching BrowserKillEvent')
 			# Dispatch BrowserKillEvent without awaiting so it gets processed after all BrowserStopEvent handlers
@@ -143,12 +145,22 @@ class LocalBrowserWatchdog(BaseWatchdog):
 				self.logger.debug(
 					f'[LocalBrowserWatchdog] 📂 user_data_dir={profile.user_data_dir}, profile_directory={profile.profile_directory}'
 				)
-				subprocess = await asyncio.create_subprocess_exec(
-					browser_path,
-					*launch_args,
-					stdout=asyncio.subprocess.PIPE,
-					stderr=asyncio.subprocess.PIPE,
-				)
+				if profile.keep_alive:
+					# A handoff must outlive the caller's event loop, pipes and process group.
+					subprocess = await asyncio.to_thread(
+						psutil.Popen,
+						[browser_path, *launch_args],
+						stdout=asyncio.subprocess.DEVNULL,
+						stderr=asyncio.subprocess.DEVNULL,
+						start_new_session=True,
+					)
+				else:
+					subprocess = await asyncio.create_subprocess_exec(
+						browser_path,
+						*launch_args,
+						stdout=asyncio.subprocess.PIPE,
+						stderr=asyncio.subprocess.PIPE,
+					)
 				self.logger.debug(
 					f'[LocalBrowserWatchdog] 🎭 Browser running with browser_pid= {subprocess.pid} 🔗 listening on CDP port :{debug_port}'
 				)
