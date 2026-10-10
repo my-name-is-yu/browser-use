@@ -1,4 +1,4 @@
-"""Browser observation and native UI operations shared by every bounded job."""
+"""Browser observation and native operations for the goal loop."""
 
 import asyncio
 import json
@@ -31,8 +31,7 @@ const targets=all.slice(0,180).map((e,i)=>{
 const ref=cfg.id+'-'+i;e.setAttribute('data-bu-ref',ref);document.__buTargets.set(ref,e);
 const p=e.closest('form,tr,[role=row],[role=dialog],[data-record-id],li')||e.parentElement||e.getRootNode().host;
 if(!groups.has(p))groups.set(p,'g'+groups.size);
-const r=e.getBoundingClientRect();
-return {ref,tag:e.tagName.toLowerCase(),type:e.type||'',label:label(e),context:norm(p?.innerText).slice(0,600),href:e.getAttribute('href')||'',value:e.type==='password'?'':e.value||'',group:groups.get(p),state:state(e),options:e.tagName==='SELECT'?[...e.options].filter(o=>!o.disabled).slice(0,240).map(o=>o.value):[],option_labels:e.tagName==='SELECT'?Object.fromEntries([...e.options].filter(o=>!o.disabled).slice(0,240).map(o=>[o.value,norm(o.label)])):{},new_tab:e.getAttribute('target')==='_blank',rect:{x:r.x,y:r.y,width:r.width,height:r.height}};
+return {ref,tag:e.tagName.toLowerCase(),type:e.type||'',label:label(e),context:norm(p?.innerText).slice(0,600),href:e.getAttribute('href')||'',value:e.type==='password'?'':e.value||'',group:groups.get(p),state:state(e),options:e.tagName==='SELECT'?[...e.options].filter(o=>!o.disabled).slice(0,240).map(o=>o.value):[],option_labels:e.tagName==='SELECT'?Object.fromEntries([...e.options].filter(o=>!o.disabled).slice(0,240).map(o=>[o.value,norm(o.label)])):{},new_tab:e.getAttribute('target')==='_blank'};
 });
 let texts=[],count=0;
 for(const region of rootsOf(root)){const w=document.createTreeWalker(region,NodeFilter.SHOW_TEXT);let n;
@@ -72,8 +71,8 @@ class BrowserDriver:
 		self.target_id = target_id
 
 	async def observe(self, *, screenshot: bool = False) -> Observation:
-		"""Include bounded text spans with their source observation; screenshots are optional."""
-		config = {'id': uuid4().hex, 'target': self.target_id, 'extract': []}
+		"""Capture current controls and source evidence; screenshots are optional."""
+		config = {'id': uuid4().hex, 'target': self.target_id}
 		observation = Observation.model_validate_json(await self.page.evaluate(OBSERVE, config))
 		if screenshot:
 			observation.screenshot = await self.page.screenshot()

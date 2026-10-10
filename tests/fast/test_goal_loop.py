@@ -1,13 +1,16 @@
 """Goal-loop handoffs preserve browser identity, input scope and request budgets."""
 
+import asyncio
+import json
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
 
-from browser_use.fast import BrowserTask, DecisionRuntime
+from browser_use.fast import BrowserTask, DecisionRuntime, RunResult
 from browser_use.fast.driver import StaleTarget, build_actions
 from browser_use.fast.views import Action, Answer, Decision, HistoryItem, Observation, Target
 
@@ -74,6 +77,30 @@ async def test_unknown_effect_is_not_replayed(tmp_path):
 	with pytest.raises(ValueError):
 		await r.run(resume=result, inputs=['value'])
 	assert r.driver.execute.await_count == 1
+
+
+async def test_interrupted_dispatch_is_saved_and_cannot_resume(tmp_path):
+	r = runtime(tmp_path, Choices('fill'))
+
+	async def interrupt(action, observed):
+		assert r.result
+		saved = RunResult.model_validate_json((Path(r.result.directory) / 'result.json').read_text())
+		assert saved.history[-1].status == 'started'
+		assert saved.budget.decisions_used == 1
+		raise asyncio.CancelledError
+
+	r.driver.execute.side_effect = interrupt
+	with pytest.raises(asyncio.CancelledError):
+		await r.run(BrowserTask(url='http://example.test', goal='Search', inputs=['value']))
+	assert r.result
+	saved = RunResult.model_validate_json((Path(r.result.directory) / 'result.json').read_text())
+	assert saved.status == 'unknown' and saved.history[-1].status == 'unknown'
+	events = [json.loads(line) for line in (Path(saved.directory) / 'journal.jsonl').read_text().splitlines()]
+	assert next(e for e in events if e['event'] == 'observed')['observation']['text'] == 'Form'
+	assert events[-1]['event'] == 'receipt'
+	with pytest.raises(ValueError):
+		await r.run(resume=saved, inputs=['value'])
+	r.driver.execute.assert_awaited_once()
 
 
 @pytest.mark.parametrize('status', ['started', 'unknown'])

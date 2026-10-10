@@ -85,7 +85,8 @@ class DecisionRuntime:
 		data = {'event': event, 'at': time.time(), **values}
 		with (Path(self.result.directory) / 'journal.jsonl').open('a') as f:
 			f.write(json.dumps(data, ensure_ascii=False) + '\n')
-		self._save()
+		if event in ('decision_started', 'dispatch', 'receipt', 'result'):
+			self._save()
 		if self.on_event:
 			await self.on_event(data)
 
@@ -159,7 +160,7 @@ class DecisionRuntime:
 						'goal': r.task.goal,
 						'available_inputs': r.task.inputs,
 						'page': {'url': o.url, 'title': o.title, 'text': o.viewport_text, 'section': o.fragment_text},
-						'targets': [t.model_dump(exclude={'rect'}) for t in o.targets],
+						'targets': [t.model_dump() for t in o.targets],
 						'recent_actions': [h.model_dump() for h in r.history[-8:]],
 					}
 					question = ChoiceQuestion(

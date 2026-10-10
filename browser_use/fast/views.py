@@ -42,7 +42,6 @@ class Target(Contract):
 	option_labels: dict[str, str] = Field(default_factory=dict)
 	state: str = ''
 	new_tab: bool = False
-	rect: dict[str, float] = Field(default_factory=dict)
 
 
 class Observation(Contract):
@@ -73,7 +72,6 @@ class Action(Contract):
 	description: str
 	ref: str = ''
 	text: str = ''
-	url: str = ''
 
 
 class Choice(Contract):

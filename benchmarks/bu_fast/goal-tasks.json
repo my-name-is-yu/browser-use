@@ -1,0 +1,146 @@
+[
+  {
+    "id": "docs-python-statistics",
+    "family": "docs",
+    "goal": "On https://docs.python.org/3.13/, collect ALL required fields: mean_definition: statistics.mean definition; mean_example: one documented statistics.mean call and its displayed result; fmean_definition: statistics.fmean definition; fmean_version: version in which statistics.fmean was added. Every field must include actual observed source text and its source URL. Preserve attribution, units, order and settings. Return collected records, not only page arrival. Use public read-only interactions, never login, post, pay or modify accounts. Missing fields must remain incomplete. For changed settings retain both baseline and changed observations.",
+    "start_url": "https://docs.python.org/3.13/",
+    "exact_input_values": [
+      "mean",
+      "fmean"
+    ],
+    "required_fields": [
+      {
+        "id": "mean_definition",
+        "requirement": "statistics.mean definition"
+      },
+      {
+        "id": "mean_example",
+        "requirement": "one documented statistics.mean call and its displayed result"
+      },
+      {
+        "id": "fmean_definition",
+        "requirement": "statistics.fmean definition"
+      },
+      {
+        "id": "fmean_version",
+        "requirement": "version in which statistics.fmean was added"
+      }
+    ],
+    "subgoal_goals": [
+      "Find the statistics.mean reference and collect its definition and one displayed example/result.",
+      "Find statistics.fmean and collect its definition and added-in version."
+    ],
+    "allowed_domains": [
+      "docs.python.org"
+    ],
+    "new_goal": true
+  },
+  {
+    "id": "docs-mdn-array",
+    "family": "docs",
+    "goal": "On https://developer.mozilla.org/en-US/, collect ALL required fields: map_definition: Array.prototype.map definition; map_example: one actual documented map example input/code/result; filter_definition: Array.prototype.filter definition; filter_example: one actual documented filter example input/code/result. Every field must include actual observed source text and its source URL. Preserve attribution, units, order and settings. Return collected records, not only page arrival. Use public read-only interactions, never login, post, pay or modify accounts. Missing fields must remain incomplete. For changed settings retain both baseline and changed observations.",
+    "start_url": "https://developer.mozilla.org/en-US/",
+    "exact_input_values": [
+      "Array.map",
+      "Array.filter"
+    ],
+    "required_fields": [
+      {
+        "id": "map_definition",
+        "requirement": "Array.prototype.map definition"
+      },
+      {
+        "id": "map_example",
+        "requirement": "one actual documented map example input/code/result"
+      },
+      {
+        "id": "filter_definition",
+        "requirement": "Array.prototype.filter definition"
+      },
+      {
+        "id": "filter_example",
+        "requirement": "one actual documented filter example input/code/result"
+      }
+    ],
+    "subgoal_goals": [
+      "Find Array.prototype.map and collect its definition and one documented example.",
+      "Find Array.prototype.filter and collect its definition and one documented example."
+    ],
+    "allowed_domains": [
+      "developer.mozilla.org"
+    ],
+    "new_goal": true
+  },
+  {
+    "id": "github-cpython-bugs",
+    "family": "filter",
+    "goal": "On https://github.com/python/cpython/issues, collect ALL required fields: applied_query: evidence query is:open label:type-bug was applied, not merely typed; result_1: first matching issue title and direct issue URL; result_2: second matching issue title and direct issue URL; result_3: third matching issue title and direct issue URL. Every field must include actual observed source text and its source URL. Preserve attribution, units, order and settings. Return collected records, not only page arrival. Use public read-only interactions, never login, post, pay or modify accounts. Missing fields must remain incomplete. For changed settings retain both baseline and changed observations.",
+    "start_url": "https://github.com/python/cpython/issues",
+    "exact_input_values": [
+      "is:open label:type-bug"
+    ],
+    "required_fields": [
+      {
+        "id": "applied_query",
+        "requirement": "evidence query is:open label:type-bug was applied, not merely typed"
+      },
+      {
+        "id": "result_1",
+        "requirement": "first matching issue title and direct issue URL"
+      },
+      {
+        "id": "result_2",
+        "requirement": "second matching issue title and direct issue URL"
+      },
+      {
+        "id": "result_3",
+        "requirement": "third matching issue title and direct issue URL"
+      }
+    ],
+    "subgoal_goals": [
+      "Apply issue query is:open label:type-bug and verify applied result state.",
+      "Collect first three matching issue titles/direct URLs in displayed order."
+    ],
+    "allowed_domains": [
+      "github.com"
+    ],
+    "new_goal": true
+  },
+  {
+    "id": "settings-length",
+    "family": "settings",
+    "goal": "On https://www.unitconverters.net/length/meter-to-feet.htm, collect ALL required fields: baseline_inputs: applied conversion1meter to feet; baseline_result: displayed feet result for1meter; changed_inputs: applied conversion10meters to feet; changed_result: displayed feet result for10meters. Every field must include actual observed source text and its source URL. Preserve attribution, units, order and settings. Return collected records, not only page arrival. Use public read-only interactions, never login, post, pay or modify accounts. Missing fields must remain incomplete. For changed settings retain both baseline and changed observations.",
+    "start_url": "https://www.unitconverters.net/length/meter-to-feet.htm",
+    "exact_input_values": [
+      "1",
+      "10"
+    ],
+    "required_fields": [
+      {
+        "id": "baseline_inputs",
+        "requirement": "applied conversion1meter to feet"
+      },
+      {
+        "id": "baseline_result",
+        "requirement": "displayed feet result for1meter"
+      },
+      {
+        "id": "changed_inputs",
+        "requirement": "applied conversion10meters to feet"
+      },
+      {
+        "id": "changed_result",
+        "requirement": "displayed feet result for10meters"
+      }
+    ],
+    "subgoal_goals": [
+      "Convert1meter to feet and collect applied inputs and displayed result.",
+      "Change to10meters and collect applied inputs and displayed result."
+    ],
+    "allowed_domains": [
+      "www.unitconverters.net",
+      "unitconverters.net"
+    ],
+    "new_goal": true
+  }
+]

@@ -28,7 +28,7 @@ dist/
 *.json
 !/server.json
 !/.codex-plugin/plugin.json
-!/benchmarks/bu_fast/results/*.json
+!/benchmarks/bu_fast/goal-tasks.json
 *.jsonl
 *.log
 *.bak
@@ -38,6 +38,7 @@ secrets.env
 .env
 .env.local
 .bu-fast/
+/benchmarks/bu_fast/results/
 browser_cookies.json
 cookies.json
 gcp-login.json

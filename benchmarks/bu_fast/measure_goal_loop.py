@@ -115,7 +115,7 @@ def tools(arm):
 
 
 def load_tasks():
-	all_tasks = json.loads((REPO / '.bu-fast/evaluations/decisions-map-20261010-phase2/live/tasks-frozen.json').read_text())
+	all_tasks = json.loads((REPO / 'benchmarks/bu_fast/goal-tasks.json').read_text())
 	return [next(t for t in all_tasks if t['id'] == i) for i in TASK_IDS]
 
 
@@ -540,7 +540,7 @@ async def main(args):
 		REPO / 'benchmarks/bu_fast/evaluate_parent_loop.py',
 		REPO / 'benchmarks/bu_fast/validate_evaluation.py',
 		REPO / 'benchmarks/bu_fast/evaluation_audit.py',
-		REPO / '.bu-fast/evaluations/decisions-map-20261010-phase2/live/tasks-frozen.json',
+		REPO / 'benchmarks/bu_fast/goal-tasks.json',
 		args.upstream / 'evaluation.py',
 		args.upstream / 'findings_judge.py',
 		args.upstream / 'screenshot_evidence.py',
