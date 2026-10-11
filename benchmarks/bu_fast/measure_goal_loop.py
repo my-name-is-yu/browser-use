@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from benchmarks.bu_fast import evaluate_parent_loop as common
 from benchmarks.bu_fast.evaluation_audit import Recorder, assert_frozen, freeze_protocol, validate_judgement
+from benchmarks.bu_fast.judge_evidence import full_judge_evidence, validate_image_budget
 from benchmarks.bu_fast.validate_evaluation import (
 	CHROME,
 	REPO,
@@ -30,6 +31,7 @@ from browser_use.actor.page import Page
 from browser_use.browser.profile import BrowserProfile, ViewportSize
 from browser_use.browser.session import BrowserSession
 from browser_use.fast import BrowserTask, DecisionClient, DecisionRuntime
+from browser_use.fast.delivery import CompleteDelivery, save_delivery, validate_delivery
 from browser_use.fast.driver import BrowserDriver
 
 TASK_IDS = ['docs-python-statistics', 'docs-mdn-array', 'github-cpython-bugs', 'settings-length']
@@ -61,7 +63,7 @@ class AuditedTransport(MeteredTransport):
 class ExperimentSettings(BaseModel):
 	"""One isolated addition; all model and total task budgets remain shared."""
 
-	variant: Literal['baseline', 'advice', 'experience', 'parallel', 'parallel-serial'] = 'baseline'
+	variant: Literal['baseline', 'advice', 'experience', 'parallel', 'parallel-serial', 'structured-delivery'] = 'baseline'
 	max_advice_requests: int = Field(default=2, ge=1, le=3)
 	memo_store: Path | None = None
 	memo_ids: list[str] = Field(default_factory=list, max_length=5)
@@ -77,6 +79,12 @@ class ResumeBrowser(BaseModel):
 
 class ReadEvidence(BaseModel):
 	ids: list[int] = Field(min_length=1, max_length=8)
+
+
+class RepairBrowser(BaseModel):
+	"""Continue a premature done using an observed deficiency, with the same goal."""
+
+	deficiency: str = Field(min_length=1)
 
 
 class FinishBrowser(BaseModel):
@@ -106,6 +114,16 @@ class TrialMetrics(BaseModel):
 	advice_calls: int = 0
 	parent_preparation_requests: int = 0
 	parallel_result: dict | None = None
+	parent_calls: int = 0
+	evidence_calls: int = 0
+	evidence_bytes: int = 0
+	evidence_tokens: int | None = None
+	repair_calls: int = 0
+	repair_seconds: float = 0
+	decisions_loop_seconds: float = 0
+	first_operation_seconds: float | None = None
+	delivery_seconds: float | None = None
+	execution_cost: dict = Field(default_factory=lambda: {'complete': False, 'usd': None, 'reason': 'Prices not supplied'})
 	wall_seconds: float = 0
 	browser_loop_seconds: float | None = None
 	parent_overlap_seconds: float = 0
@@ -119,6 +137,24 @@ def tools(arm, experiment=None):
 		('read_evidence', 'Read prior observations by the supplied index IDs.', ReadEvidence),
 		('finish_browser', 'Record that browser outcomes are observed; this claim is independently graded.', FinishBrowser),
 	]
+	if experiment and experiment.variant == 'structured-delivery':
+		result = [tool for tool in result if tool['name'] != 'write_artifact']
+		extra = [
+			extra[0],
+			(
+				'complete_delivery',
+				'Judge completeness from retrieved evidence and return all records and final answer. Code saves both files. Use continue for additional evidence or recovery; incomplete for honest terminal missing fields.',
+				CompleteDelivery,
+			),
+		]
+		if arm == 'goal':
+			extra.append(
+				(
+					'repair_browser',
+					'Repair a premature done with observed missing or unapplied outcomes on the SAME goal and budget.',
+					RepairBrowser,
+				)
+			)
 	if arm == 'goal':
 		extra.append(('resume_browser', 'Supply exact new text to a needs_input run on the same browser.', ResumeBrowser))
 	if experiment and experiment.variant == 'advice':
@@ -166,6 +202,7 @@ def evidence_item(o):
 
 
 async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSettings | None = None):
+	began = time.monotonic()
 	experiment = experiment or ExperimentSettings()
 	directory.mkdir(parents=True)
 	(directory / 'outputs').mkdir()
@@ -194,17 +231,20 @@ async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSett
 	trace = Trace(final_result='', agent_steps=[], screenshots_b64=[], screenshot_steps=[])
 	observed = []
 	metrics = TrialMetrics(task=task['id'], arm=arm, repeat=repeat, experiment=experiment.variant)
-	began = time.monotonic()
 	deadline = began + 240
 	runtime = None
 	last = None
 	operation_trace = None
 	delegation_trace = None
+	initial_delegation_trace = None
 	receipts = {}
 	parent_starts = {}
 	browser_intervals = []
 	parent_intervals = []
 	delegate_began = 0.0
+	first_operation = None
+	retrieved_evidence = []
+	delivery_finished = False
 
 	async def snapshot(driver):
 		o = (await driver.observe()).model_dump(exclude={'screenshot'})
@@ -233,11 +273,17 @@ async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSett
 				metrics.browser_actions += 1
 			trace.agent_steps.append(json.dumps(data, ensure_ascii=False))
 
-	async def delegate(resume=None, inputs=None, advice=None):
-		nonlocal runtime, last, delegation_trace, delegate_began
+	async def delegate(resume=None, inputs=None, advice=None, repair=None):
+		nonlocal runtime, last, delegation_trace, initial_delegation_trace, delegate_began, first_operation
 		delegate_began = time.time()
+		loop_start = time.monotonic()
+		if first_operation is None:
+			first_operation = loop_start
+			metrics.first_operation_seconds = loop_start - began
 		options = {}
 		run_options = {}
+		if repair is not None:
+			run_options['repair'] = repair
 		if experiment.variant == 'advice':
 			options['max_advice_requests'] = experiment.max_advice_requests
 			if advice is not None:
@@ -270,18 +316,25 @@ async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSett
 			on_event=event,
 			**options,
 		)
-		last = await runtime.run(
-			BrowserTask(url=task['start_url'], goal=task['goal'], inputs=task['exact_input_values']) if resume is None else None,
-			resume=resume,
-			inputs=inputs,
-			**run_options,
-		)
+		try:
+			last = await runtime.run(
+				BrowserTask(url=task['start_url'], goal=task['goal'], inputs=task['exact_input_values'])
+				if resume is None
+				else None,
+				resume=resume,
+				inputs=inputs,
+				**run_options,
+			)
+		finally:
+			metrics.decisions_loop_seconds += time.monotonic() - loop_start
+			delegation_trace = trace.model_copy(deep=True)
+			if initial_delegation_trace is None:
+				initial_delegation_trace = delegation_trace.model_copy(deep=True)
 		metrics.handoffs.append(last.reason)
 		if last.status != 'done':
 			metrics.parent_returns += 1
 		metrics.delegate_seconds = time.monotonic() - began
 		metrics.delegate_status = last.status
-		delegation_trace = trace.model_copy(deep=True)
 		summary = last.summary()
 		if experiment.variant in ('parallel', 'parallel-serial'):
 			manifest = Path(last.directory) / 'parallel/result.json'
@@ -298,6 +351,8 @@ async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSett
 		if arm == 'goal':
 			initial = await delegate()
 		else:
+			first_operation = time.monotonic()
+			metrics.first_operation_seconds = first_operation - began
 			await page.goto(task['start_url'])
 			initial = await snapshot(driver)
 			await capture(page, {'initial_navigation': task['start_url']}, initial)
@@ -312,7 +367,19 @@ async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSett
 		messages = [
 			{
 				'role': 'system',
-				'content': PARENT_POLICY
+				'content': (
+					PARENT_POLICY.replace(
+						'Use finish_browser when all required browser outcomes have been observed, BEFORE writing files; later browser recovery is allowed and counted.',
+						'',
+					)
+					if experiment.variant == 'structured-delivery'
+					else PARENT_POLICY
+				)
+				+ (
+					'\nFor this variant, use complete_delivery instead of finish_browser, write_artifact and separate final text. One call returns disposition, browser_summary, every required id/value/quote/source_url, issues, final_answer. Read evidence first; no body evidence is automatically attached. DONE is provisional: inspect applied states and all requirements, then obtain missing evidence or repair_browser with the observed deficiency. Do not claim success from a typed search or unapplied setting. continue keeps the session open; incomplete saves missing fields honestly.'
+					if experiment.variant == 'structured-delivery'
+					else ''
+				)
 				+ (
 					'\nOn needs_advice inspect saved observations and recent operation receipts, then supply_advice to continue the SAME goal. Advice must be natural language interpretation/direction only. Prefer this to taking over browser actions. Handoff time and calls count toward total budgets.'
 					if experiment.variant == 'advice'
@@ -323,7 +390,12 @@ async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSett
 				'role': 'user',
 				'content': task['goal']
 				+ '\nRequired outputs: results.json and report.md. Known exact input values: '
-				+ json.dumps(task['exact_input_values']),
+				+ json.dumps(task['exact_input_values'])
+				+ (
+					'\nRequired fields: ' + json.dumps(task['required_fields'])
+					if experiment.variant == 'structured-delivery'
+					else ''
+				),
 			},
 			{'role': 'user', 'content': json.dumps(initial, ensure_ascii=False)},
 		]
@@ -343,6 +415,7 @@ async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSett
 					+ json.dumps(evidence_index(), ensure_ascii=False),
 				}
 			)
+			metrics.parent_calls += 1
 			pending = asyncio.create_task(
 				parent.responses.create(
 					model='gpt-6.1-sol',
@@ -370,13 +443,46 @@ async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSett
 			messages.extend(i.model_dump(exclude_none=True) for i in response.output)
 			calls = [i for i in response.output if i.type == 'function_call']
 			if not calls:
+				if experiment.variant == 'structured-delivery':
+					messages.append(
+						{'role': 'user', 'content': 'Use complete_delivery for structured final output; no files were saved.'}
+					)
+					continue
 				trace.final_result = response.output_text
 				(directory / 'final.txt').write_text(trace.final_result)
 				metrics.status = 'finished'
 				break
 
 			async def handle(call):
-				nonlocal operation_trace
+				nonlocal operation_trace, delivery_finished
+				if call.name == 'complete_delivery':
+					data = CompleteDelivery.model_validate_json(call.arguments)
+					validate_delivery(data, [f['id'] for f in task['required_fields']], retrieved_evidence)
+					if data.disposition == 'continue':
+						(directory / f'provisional-{turn:02d}.json').write_text(data.model_dump_json())
+						return {'continue': True, 'issues': data.issues}
+					metrics.operation_seconds = time.monotonic() - began
+					operation_trace = trace.model_copy(deep=True)
+					operation_trace.final_result = data.browser_summary
+					receipt = save_delivery(data, directory / 'outputs')
+					for name in receipt.files:
+						receipts[name] = common.artifact_receipt(directory / 'outputs' / name)
+					trace.final_result = data.final_answer
+					(directory / 'final.txt').write_text(data.final_answer)
+					(directory / 'delivery.json').write_text(data.model_dump_json())
+					metrics.status = 'finished'
+					delivery_finished = True
+					return receipt.model_dump()
+				if call.name == 'repair_browser':
+					data = RepairBrowser.model_validate_json(call.arguments)
+					if not last or last.status != 'done':
+						raise ValueError('Repair requires a premature done')
+					metrics.repair_calls += 1
+					start_repair = time.monotonic()
+					try:
+						return await delegate(last, repair=data.deficiency)
+					finally:
+						metrics.repair_seconds += time.monotonic() - start_repair
 				if call.name == 'supply_advice':
 					if not last or last.status != 'needs_advice':
 						raise ValueError('No saved advice handoff')
@@ -391,7 +497,13 @@ async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSett
 					return await delegate(last, data.inputs)
 				if call.name == 'read_evidence':
 					data = ReadEvidence.model_validate_json(call.arguments)
-					return [evidence_item(observed[i]) for i in data.ids]
+					if any(i < 0 or i >= len(observed) for i in data.ids):
+						raise ValueError('Unknown evidence index')
+					items = [evidence_item(observed[i]) for i in data.ids]
+					retrieved_evidence.extend(items)
+					metrics.evidence_calls += 1
+					metrics.evidence_bytes += len(json.dumps(items, ensure_ascii=False).encode())
+					return items
 				if call.name == 'finish_browser':
 					data = FinishBrowser.model_validate_json(call.arguments)
 					metrics.operation_seconds = time.monotonic() - began
@@ -408,6 +520,12 @@ async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSett
 				if call.name != 'browser_batch':
 					raise ValueError('Unknown tool')
 				batch = common.NativeBatch.model_validate_json(call.arguments)
+				native_repair = (metrics.operation_seconds is not None or (last and last.status == 'done')) and any(
+					a.op not in ('read', 'extract', 'screenshot') for a in batch.actions
+				)
+				repair_started = time.monotonic()
+				if native_repair:
+					metrics.repair_calls += 1
 				results = []
 				for a in batch.actions:
 					if time.monotonic() >= deadline:
@@ -415,12 +533,20 @@ async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSett
 					try:
 						if a.op == 'read':
 							out = await snapshot(driver)
+							retrieved_evidence.append(evidence_item(out))
 						elif a.op == 'extract':
 							out = json.loads(
 								await page.evaluate(
 									"""(selector)=>Array.from(document.querySelectorAll(selector)).filter(e=>e.getClientRects().length).slice(0,200).map(e=>({text:e.innerText,href:e.href||'',links:Array.from(e.querySelectorAll('a[href]')).map(a=>({text:a.innerText,href:a.href}))}))""",
 									a.selector,
 								)
+							)
+							retrieved_evidence.append(
+								{
+									'url': await page.get_url(),
+									'extracted': out,
+									'links': [link for row in out for link in [*row['links'], {'href': row['href']}]],
+								}
 							)
 						elif a.op == 'screenshot':
 							out = {'requested': True}
@@ -457,6 +583,8 @@ async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSett
 						await capture(page, a.model_dump(), out)
 						results.append(out)
 						break
+				if native_repair:
+					metrics.repair_seconds += time.monotonic() - repair_started
 				return results
 
 			for call in calls:
@@ -482,12 +610,18 @@ async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSett
 				)
 				if status == 'timeout':
 					raise TimeoutError('Task deadline reached')
+				if delivery_finished:
+					break
+			if delivery_finished:
+				break
 		else:
 			metrics.error = 'Parent turn budget exhausted'
 	except TimeoutError:
 		metrics.status, metrics.error = 'timeout', 'Task deadline reached'
 	except Exception as e:
 		metrics.error = f'{type(e).__name__}: {e}'
+	if first_operation is not None:
+		metrics.delivery_seconds = time.monotonic() - first_operation - metrics.settlement_seconds
 	metrics.wall_seconds = time.monotonic() - began
 	metrics.seconds = metrics.wall_seconds - metrics.settlement_seconds
 	for name, receipt in receipts.items():
@@ -499,7 +633,12 @@ async def execute_trial(task, arm, repeat, directory, experiment: ExperimentSett
 	if operation_trace is None:
 		operation_trace = trace.model_copy(deep=True)
 		operation_trace.output_files_text = ''
-	for name, value in [('trace', trace), ('operation-trace', operation_trace), ('delegation-trace', delegation_trace)]:
+	for name, value in [
+		('trace', trace),
+		('operation-trace', operation_trace),
+		('delegation-trace', initial_delegation_trace),
+		('final-delegation-trace', delegation_trace),
+	]:
 		if value:
 			(directory / (name + '.json')).write_text(value.model_dump_json())
 	(directory / 'observations.json').write_text(json.dumps(observed, ensure_ascii=False))
@@ -540,7 +679,7 @@ def grading_task(task, operation=False):
 			+ '. Both results.json and report.md must contain this field with observed quote and supporting source URL. Missing files violate every item.'
 			for f in fields
 		)
-		+ ' Titles, URLs and ranks must belong to the same filtered list row. Conversion results must match the separately applied baseline and changed inputs. Source claims without observation are insufficient.',
+		+ ' Titles, URLs and ranks must belong to the same filtered list row. Conversion results must match the separately applied baseline and changed inputs. Source claims without observation are insufficient. The final answer must accurately summarize the same records, include supporting source links and explicitly indicate missing fields.',
 	}
 
 
@@ -572,9 +711,57 @@ def compact_trace(trace: Trace) -> Trace:
 	return projected
 
 
+def restore_trace(trace: Trace) -> Trace:
+	"""Reconstruct interned evidence exactly; unresolved references are collection errors."""
+	values = {}
+
+	def restore(value):
+		if isinstance(value, dict):
+			if set(value) == {'evidence_value_ref'}:
+				return values[value['evidence_value_ref']]
+			if set(value) == {'evidence_value_id', 'value'}:
+				content = restore(value['value'])
+				values[value['evidence_value_id']] = content
+				return content
+			return {key: restore(child) for key, child in value.items()}
+		if isinstance(value, list):
+			return [restore(child) for child in value]
+		return value
+
+	result = trace.model_copy(deep=True)
+	result.agent_steps = [json.dumps(restore(json.loads(step)), ensure_ascii=False) for step in trace.agent_steps]
+	return result
+
+
+def prepare_judge_evidence(output: Path, evaluation) -> dict:
+	"""Verify lossless projection and size the local judge adapter to the frozen batch."""
+	checked = 0
+	for directory in output.iterdir():
+		if not directory.is_dir() or not (directory / 'result.json').exists():
+			continue
+		for name in ('trace', 'operation-trace', 'delegation-trace', 'final-delegation-trace'):
+			path = directory / (name + '.json')
+			if not path.exists():
+				continue
+			original = Trace.model_validate_json(path.read_text())
+			projected = compact_trace(original)
+			restored = restore_trace(projected)
+			if [json.loads(s) for s in original.agent_steps] != [json.loads(s) for s in restored.agent_steps]:
+				raise ValueError(f'Evidence projection changed events: {path}')
+			checked += 1
+	return {
+		'traces_verified': checked,
+		'text_limits': sys.maxsize,
+		'image_limit': 500,
+		'image_bytes_limit': 100_000_000,
+		'projection': 'lossless',
+	}
+
+
 async def grade(output, upstream):
 	sys.path.insert(0, str(upstream))
 	evaluation = importlib.import_module('evaluation')
+	(output / 'judge-evidence-preflight.json').write_text(json.dumps(prepare_judge_evidence(output, evaluation), indent=2))
 	requests = []
 	judge = ResponsesJudge(
 		evaluation.create_judge(),
@@ -587,36 +774,51 @@ async def grade(output, upstream):
 		async with semaphore:
 			result = json.loads((directory / 'result.json').read_text())
 			task = tasks[result['task']]
-			for name in ['operation', 'delivery', 'delegation']:
+			for name in ['operation', 'delivery', 'delegation', 'final_delegation']:
 				path = directory / (
-					{'operation': 'operation-trace', 'delivery': 'trace', 'delegation': 'delegation-trace'}[name] + '.json'
+					{
+						'operation': 'operation-trace',
+						'delivery': 'trace',
+						'delegation': 'delegation-trace',
+						'final_delegation': 'final-delegation-trace',
+					}[name]
+					+ '.json'
 				)
 				if not path.exists():
 					continue
 				trace = compact_trace(Trace.model_validate_json(path.read_text()))
 				(directory / (name + '-judge-trace.json')).write_text(trace.model_dump_json())
 				spec = grading_task(task, name != 'delivery')
+				clipped = evaluation.evidence_truncation_sections(spec, trace.model_dump())
+				if clipped:
+					result[name] = {'verdict': {'complete': None, 'assessable': False, 'reasons': ['clipped_evidence', *clipped]}}
+					(directory / 'graded.json').write_text(json.dumps(result, ensure_ascii=False, indent=2))
+					continue
 				print(json.dumps({'event': 'grade', 'trial': directory.name, 'kind': name}), flush=True)
 				try:
+					validate_image_budget(trace.model_dump())
 					judgement = await judge_collected_trace(
 						spec, trace, judge, evaluation.judge_trace, output / 'judge' / directory.name / name
 					)
 					if judgement.get('assessment_status') == 'collection_failure':
-						verdict = {'complete': False, 'assessable': False, 'reasons': ['collection_gap']}
+						verdict = {'complete': None, 'assessable': False, 'reasons': ['collection_gap']}
 					else:
 						verdict = validate_judgement(
 							judgement, spec['weights'], oracle=None, collection_gaps=trace.collection_gaps
 						).model_dump()
+					if not verdict.get('assessable', True):
+						verdict['complete'] = None
 					result[name] = {'verdict': verdict, 'judgement': judgement}
 				except Exception as e:
-					result[name] = {'verdict': {'complete': False, 'assessable': False, 'reasons': [f'{type(e).__name__}: {e}']}}
+					result[name] = {'verdict': {'complete': None, 'assessable': False, 'reasons': [f'{type(e).__name__}: {e}']}}
 				(directory / 'graded.json').write_text(json.dumps(result, ensure_ascii=False, indent=2))
 
 	try:
 		directories = sorted(
 			p for p in output.iterdir() if p.is_dir() and (p / 'result.json').exists() and (p / 'trace.json').exists()
 		)
-		await asyncio.gather(*(grade_one(p) for p in directories))
+		with full_judge_evidence(evaluation):
+			await asyncio.gather(*(grade_one(p) for p in directories))
 	finally:
 		await judge.client.close()
 	summary = {

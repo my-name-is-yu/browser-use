@@ -91,11 +91,19 @@ class DecisionRuntime:
 			await self.on_event(data)
 
 	async def run(
-		self, task: BrowserTask | None = None, *, resume: RunResult | None = None, inputs: list[str] | None = None
+		self,
+		task: BrowserTask | None = None,
+		*,
+		resume: RunResult | None = None,
+		inputs: list[str] | None = None,
+		repair: str | None = None,
 	) -> RunResult:
-		"""A resume supplies new strings, preserving task, browser, history and deadline."""
+		"""Resume inputs or repair a premature done, retaining goal, identity and budget."""
 		if resume:
-			if task is not None or resume.status != 'needs_input' or not inputs:
+			if repair is not None:
+				if task is not None or resume.status != 'done' or inputs or not repair.strip():
+					raise ValueError('Repair requires a done run, observed deficiency and unchanged goal')
+			elif task is not None or resume.status != 'needs_input' or not inputs:
 				raise ValueError('Only needs_input can resume, with new text and no replacement goal')
 			if any(item.status in ('started', 'unknown') for item in resume.history):
 				raise ValueError('Cannot resume a run with an unresolved operation receipt')
@@ -103,10 +111,12 @@ class DecisionRuntime:
 				raise ValueError('Resume must use the same browser and tab')
 			self.result = resume.model_copy(deep=True)
 			self.managed_browser = resume.managed_browser
-			self.result.task.inputs = list(dict.fromkeys([*resume.task.inputs, *inputs]))
+			self.result.task.inputs = list(dict.fromkeys([*resume.task.inputs, *(inputs or [])]))
 			self.result.task = BrowserTask.model_validate(self.result.task.model_dump())
 			self.result.input_target = None
 		else:
+			if repair is not None:
+				raise ValueError('Repair requires a saved run')
 			if task is None:
 				raise ValueError('A browser task is required')
 			run_id = uuid4().hex
@@ -128,6 +138,8 @@ class DecisionRuntime:
 				r.cdp_url = self.browser.cdp_url
 				r.target_id = self.target_id
 				r.managed_browser = self.managed_browser
+				if repair:
+					await self._event('repair_started', deficiency=repair, budget=r.budget.model_dump())
 				if not resume:
 					await self.driver.page.goto(r.task.url)
 					await self._event('navigation', url=r.task.url)
@@ -159,6 +171,7 @@ class DecisionRuntime:
 					state = {
 						'goal': r.task.goal,
 						'available_inputs': r.task.inputs,
+						**({'completion_deficiency': repair} if repair else {}),
 						'page': {'url': o.url, 'title': o.title, 'text': o.viewport_text, 'section': o.fragment_text},
 						'targets': [t.model_dump() for t in o.targets],
 						'recent_actions': [h.model_dump() for h in r.history[-8:]],

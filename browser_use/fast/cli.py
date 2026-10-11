@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import json
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -9,6 +10,7 @@ from dotenv import load_dotenv
 from browser_use.browser.profile import BrowserProfile
 from browser_use.browser.session import BrowserSession
 from browser_use.fast import BrowserTask, DecisionRuntime, RunResult
+from browser_use.fast.delivery import complete_run
 
 
 async def execute(args):
@@ -45,6 +47,10 @@ async def execute(args):
 def main():
 	parser = argparse.ArgumentParser(description='Goal-driven Decisions browser loop')
 	commands = parser.add_subparsers(dest='command', required=True)
+	complete = commands.add_parser('complete', help='Save a structured Codex delivery using recorded evidence; no model calls')
+	complete.add_argument('result', type=Path)
+	complete.add_argument('--delivery', type=Path, required=True)
+	complete.add_argument('--required-field', action='append', required=True)
 	for name in ['start', 'resume']:
 		command = commands.add_parser(name)
 		if name == 'start':
@@ -60,8 +66,11 @@ def main():
 		command.add_argument('--visible', action='store_true')
 		command.add_argument('--executable-path')
 	args = parser.parse_args()
+	if args.command == 'complete':
+		receipt = complete_run(args.result, args.delivery, args.required_field)
+		print(receipt.model_dump_json())
+		raise SystemExit(0 if receipt.disposition == 'complete' else 2)
 	result = asyncio.run(execute(args))
-	import json
 
 	print(json.dumps(result.summary(), ensure_ascii=False))
 	raise SystemExit(0 if result.status == 'done' else 2)

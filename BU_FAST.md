@@ -13,11 +13,11 @@ uv run bu-fast start --url 'https://対象サイト/' --goal '達成したいブ
 uv run bu-fast resume .bu-fast/runs/RUN_ID/result.json --input 'Codexが補った値'
 ```
 
-入口はstartとresumeだけです。Job・TaskContract・patch・全文details APIはありません。入出力はPydanticで検証します。Decisionsは既存の操作対象と値から選び、文字列・selector・コードは生成しません。入力不足以外のblocked・unknownは自動再開しません。
+ブラウザ操作の入口はstartとresumeです。成果保存にはcompleteを使います。Job・TaskContract・patch・全文details APIはありません。入出力はPydanticで検証します。Decisionsは既存の操作対象と値から選び、文字列・selector・コードは生成しません。入力不足以外のblocked・unknownは自動再開しません。
 
 モデルはgpt-6-luna。CLIは.env.localの既存OPENAI_API_KEYを読みます。キーはログに保存しません。専用ブラウザを作成し、needs_inputとunknownでは保持します。DONEなどで終了すると閉じます。--visible、--executable-path、--timeout、--max-decisionsを指定できます。再開で時間と要求回数は補充しません。
 
-stdoutは短い結果です。result_pathに状態、evidence_pathに時系列の観測・リンク・見出し・入力・操作receiptを保存します。DONEはモデルによるブラウザ作業の完了判断で、成果の正しさの独立検証ではありません。最終回答と出典付き成果はCodexが保存した観測から作成します。
+stdoutは短い結果です。result_pathに状態、evidence_pathに時系列の観測・リンク・見出し・入力・操作receiptを保存します。DONEはモデルによるブラウザ作業の完了判断で、成果の正しさの独立検証ではありません。Codexが保存した観測から結果と最終回答をまとめて作り、completeが引用を検証して成果を保存します。
 
 ブラウザ操作はBrowser UseのCDP/Actorを使い、対象が変わった場合は再観測します。操作の効果が不明になった場合はunknownで止め、自動で同じ操作を送信しません。confidenceの共通閾値は設けません。候補が255を超えた場合は切り捨てずblockedにします。
 
@@ -59,3 +59,17 @@ git switch -c yu/experiment-advice bu-fast-baseline-v1
 uv run --no-sync python -m benchmarks.bu_fast.measure_architectures --protocol /absolute/path/protocol.json --run
 uv run --no-sync python -m benchmarks.bu_fast.measure_architectures --protocol /absolute/path/protocol.json --grade-only
 ```
+
+## 採用方式：A（成果をまとめて保存）
+
+Codexが必要な観測を読み、完了判断・結果レコード・最終回答を一つのJSONにまとめます。`complete`はモデルを呼ばず、同じレコードからresults.jsonとreport.mdを生成し、final.txtとdelivery.jsonを保存します。引用の存在・出典URL・必須フィールドを検証します。意味的な正しさは別途確認してください。
+
+```sh
+uv run bu-fast complete .bu-fast/runs/RUN_ID/result.json --delivery /absolute/path/delivery-input.json --required-field FIELD_ID
+```
+
+`--required-field`はユーザーが求める項目IDごとに指定します。入力JSONは`CompleteDelivery`スキーマ（`browser_use.fast.delivery`）です。`disposition`はcompleteまたはincomplete、`browser_summary`は操作結果の要約、`records`は各項目のid/value/quote/source_url、`issues`は不足項目、`final_answer`は出典リンク付きの最終回答です。不足する項目はvalue/quote/source_urlをnullにしてincompleteにします。追加確認が必要なcontinueは成果保存せず、必要な証拠・操作を先に確認します。
+
+保存先はrunディレクトリ内のdeliveryです。completeはブラウザや操作状態を変更しません。検証エラー時は根拠とレコードを修正し、根拠のない値を埋めないでください。CLIは従来どおりdoneで専用ブラウザを閉じます。計測側の同じセッション内のdone修復を、閉じたCLIセッションで使えるとは扱いません。
+
+Aの開発比較は`benchmarks.bu_fast.measure_delivery`で基準型とstructured-deliveryを選びます。基準型は比較用に残します。4開発課題の主比較8組すべてで短縮（61.0→40.3秒）、Aの全10成果が合格しました。未使用課題・実Codexで同じ短縮幅になるかは未確認です。測定原本は[計測報告](.bu-fast/evaluations/parent-reduction-reviewed-20261011/REPORT.md)に保存しています。
