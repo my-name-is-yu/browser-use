@@ -203,6 +203,7 @@ class RunResult(Contract):
 
 	run_id: str
 	directory: str
+	log_directory: str | None = None
 	task: BrowserTask
 	initial_inputs: list[str] = Field(default_factory=list, max_length=20)
 	budget: RunBudget
@@ -227,8 +228,9 @@ class RunResult(Contract):
 			'recent_actions': [h.model_dump() for h in self.history[-8:]],
 			'budget': self.budget.model_dump(),
 			'result_path': self.directory + '/result.json',
-			'evidence_path': self.directory + '/journal.jsonl',
 		}
+		if self.log_directory is not None:
+			result['evidence_path'] = self.log_directory + '/journal.jsonl'
 		if self.completion_missing_condition is not None:
 			result['completion_missing_condition'] = self.completion_missing_condition
 		return result

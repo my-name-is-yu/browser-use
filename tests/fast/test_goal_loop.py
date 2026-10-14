@@ -42,7 +42,7 @@ class Choices:
 		return Decision(answer=Answer(type='choice', name='action', choice=choice.value), latency_ms=1)
 
 
-def runtime(tmp_path, choices, *, navigate_to_start=True):
+def runtime(tmp_path, choices, *, navigate_to_start=True, save_logs=True):
 	browser = SimpleNamespace(
 		cdp_url='http://browser', agent_focus_target_id='tab', start=AsyncMock(), stop=AsyncMock(), kill=AsyncMock()
 	)
@@ -53,6 +53,7 @@ def runtime(tmp_path, choices, *, navigate_to_start=True):
 		timeout=180,
 		max_decisions=90,
 		output_dir=tmp_path,
+		log_dir=tmp_path if save_logs else None,
 		navigate_to_start=navigate_to_start,
 	)
 
@@ -80,8 +81,24 @@ async def test_existing_tab_runs_from_current_state_without_reloading(tmp_path):
 	assert result.observation.document_id == 'd'
 
 
-async def test_input_request_resume_retains_identity_and_budget(tmp_path):
-	r = runtime(tmp_path, Choices('ask codex'))
+async def test_runtime_without_diagnostic_logs_keeps_images_state_and_input_resume(tmp_path):
+	r = runtime(tmp_path, Choices('ask codex', 'every requested'), save_logs=False)
+	first = await r.run(BrowserTask(url='http://example.test', goal='Search'))
+	final = await r.run(resume=first, inputs=['Python'])
+	assert final.status == 'done' and final.run_id == first.run_id
+	assert final.budget.deadline_at == first.budget.deadline_at
+	directory = Path(final.directory)
+	assert (directory / 'o.png').read_bytes() == b'image'
+	saved = RunResult.model_validate_json((directory / 'result.json').read_text())
+	assert saved.observation is not None and saved.observation.screenshot == 'aW1hZ2U='
+	assert not (directory / 'journal.jsonl').exists()
+	assert 'evidence_path' not in final.summary()
+	assert Path(final.summary()['result_path']).is_file()
+
+
+@pytest.mark.parametrize('save_logs', [False, True])
+async def test_input_request_resume_retains_identity_and_budget(tmp_path, save_logs):
+	r = runtime(tmp_path, Choices('ask codex'), save_logs=save_logs)
 	first = await r.run(BrowserTask(url='http://example.test', goal='Search for Python'))
 	assert first.status == 'needs_input' and first.input_target.ref == 'field'
 	before = first.budget.deadline_at
@@ -160,8 +177,9 @@ def test_decision_page_preserves_source_collection_truncation(source_truncated):
 	assert page.document_text_truncated is source_truncated
 
 
-async def test_interrupted_dispatch_is_saved_and_cannot_resume(tmp_path):
-	r = runtime(tmp_path, Choices('fill'))
+@pytest.mark.parametrize('save_logs', [False, True])
+async def test_interrupted_dispatch_is_saved_and_cannot_resume(tmp_path, save_logs):
+	r = runtime(tmp_path, Choices('fill'), save_logs=save_logs)
 
 	async def interrupt(action, observed):
 		assert r.result
@@ -176,9 +194,12 @@ async def test_interrupted_dispatch_is_saved_and_cannot_resume(tmp_path):
 	assert r.result
 	saved = RunResult.model_validate_json((Path(r.result.directory) / 'result.json').read_text())
 	assert saved.status == 'unknown' and saved.history[-1].status == 'unknown'
-	events = [json.loads(line) for line in (Path(saved.directory) / 'journal.jsonl').read_text().splitlines()]
-	assert next(e for e in events if e['event'] == 'observed')['observation']['text'] == 'Form'
-	assert events[-1]['event'] == 'receipt'
+	if save_logs:
+		events = [json.loads(line) for line in (Path(saved.directory) / 'journal.jsonl').read_text().splitlines()]
+		assert next(e for e in events if e['event'] == 'observed')['observation']['text'] == 'Form'
+		assert events[-1]['event'] == 'receipt'
+	else:
+		assert not (Path(saved.directory) / 'journal.jsonl').exists()
 	with pytest.raises(ValueError):
 		await r.run(resume=saved, inputs=['value'])
 	r.driver.execute.assert_awaited_once()
@@ -252,8 +273,9 @@ def recovery_receipt(result, after=None):
 	)
 
 
-async def test_blocked_recovery_reobserves_and_preserves_budget(tmp_path):
-	r = runtime(tmp_path, Choices('no supported operation'))
+@pytest.mark.parametrize('save_logs', [False, True])
+async def test_blocked_recovery_reobserves_and_preserves_budget(tmp_path, save_logs):
+	r = runtime(tmp_path, Choices('no supported operation'), save_logs=save_logs)
 	first = await r.run(BrowserTask(url='http://example.test', goal='Search'))
 	after = observation('recovered')
 	after.id, after.document_id = 'recovered', 'new-document'
@@ -266,8 +288,11 @@ async def test_blocked_recovery_reobserves_and_preserves_budget(tmp_path):
 	assert len(final.recovery_receipts) == 1 and r.driver.page.goto.await_count == 1
 	assert r.decisions.calls[0][0]['targets'][0]['value'] == 'recovered'
 	assert 'native_recovery' in r.decisions.calls[0][0]
-	events = [json.loads(line) for line in (Path(final.directory) / 'journal.jsonl').read_text().splitlines()]
-	assert any(e['event'] == 'recovery_receipt' for e in events)
+	if save_logs:
+		events = [json.loads(line) for line in (Path(final.directory) / 'journal.jsonl').read_text().splitlines()]
+		assert any(e['event'] == 'recovery_receipt' for e in events)
+	else:
+		assert not (Path(final.directory) / 'journal.jsonl').exists()
 
 
 async def test_recovery_rejects_changed_document_without_new_decision(tmp_path):

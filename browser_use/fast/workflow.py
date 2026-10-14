@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Literal, cast
@@ -49,6 +50,7 @@ class WorkflowSettings(Contract):
 	deadline_seconds: int = Field(default=180, ge=1)
 	parent_turn_budget: int = Field(default=24, ge=1)
 	max_decisions: int = Field(default=90, ge=1)
+	log_dir: Path | None = None
 	executable_path: str | None = None
 	headless: bool | None = None
 	browser_profile: BrowserProfile | None = None
@@ -85,6 +87,8 @@ class WorkflowResult(Contract):
 
 	task: str
 	directory: str
+	runtime_directory: str | None = None
+	log_directory: str | None = None
 	status: Literal['complete', 'incomplete', 'error', 'timeout', 'interrupted'] = 'error'
 	error: str | None = None
 	seconds: float = 0
@@ -159,8 +163,12 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 	settings = settings or WorkflowSettings()
 	directory.mkdir(parents=True)
 	(directory / 'outputs').mkdir()
+	runtime_directory = Path(tempfile.mkdtemp(prefix='bu-fast-workflow-'))
+	log_directory = (settings.log_dir / directory.name).resolve() if settings.log_dir is not None else None
+	if log_directory is not None:
+		log_directory.mkdir(parents=True, mode=0o700, exist_ok=True)
 	requests = []
-	ledger = directory / 'http-attempts.jsonl'
+	ledger = log_directory / 'http-attempts.jsonl' if log_directory is not None else None
 	parent = AsyncOpenAI(
 		api_key=os.environ['OPENAI_API_KEY'],
 		max_retries=0,
@@ -176,7 +184,12 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 		keep_alive=True if attached else None,
 	)
 	try:
-		metrics = WorkflowResult(task=task_data['id'], directory=str(directory.resolve()))
+		metrics = WorkflowResult(
+			task=task_data['id'],
+			directory=str(directory.resolve()),
+			runtime_directory=str(runtime_directory),
+			log_directory=str(log_directory) if log_directory is not None else None,
+		)
 		deadline = began + settings.deadline_seconds
 		native_dispatch_inflight = False
 		shared_ledger = EvidenceLedger()
@@ -224,7 +237,8 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 				decisions=decision,
 				timeout=max(0.001, deadline - time.monotonic()),
 				max_decisions=settings.max_decisions,
-				output_dir=directory / 'runs',
+				output_dir=runtime_directory / 'runs',
+				log_dir=log_directory / 'runs' if log_directory is not None else None,
 				plan=PurposePlan(conditions=task_data['required_fields']),
 				ledger=shared_ledger,
 				navigate_to_start=not attached,
@@ -283,7 +297,8 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 					),
 					max(0, deadline - time.monotonic()),
 				)
-				(directory / f'parent-{turn:02d}.json').write_text(response.model_dump_json())
+				if log_directory is not None:
+					(log_directory / f'parent-{turn:02d}.json').write_text(response.model_dump_json())
 				if response.status != 'completed':
 					raise RuntimeError('Incomplete parent output')
 				messages.extend(i.model_dump(exclude_none=True) for i in response.output)
@@ -297,7 +312,8 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 				async def handle(call):
 					nonlocal native_dispatch_inflight
 					if call.name == 'complete_delivery':
-						(directory / f'attempted-delivery-{turn:02d}.json').write_text(call.arguments)
+						if log_directory is not None:
+							(log_directory / f'attempted-delivery-{turn:02d}.json').write_text(call.arguments)
 						draft = CitedDelivery.model_validate_json(call.arguments)
 						if draft.disposition == 'continue':
 							return {'continue': True, 'issues': draft.issues}
@@ -417,7 +433,7 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 								for action, result in zip(batch.actions, results)
 							],
 						)
-						recovery_path = directory / f'recovery-{turn:02d}.json'
+						recovery_path = runtime_directory / f'recovery-{turn:02d}.json'
 						recovery_path.write_text(recovery.model_dump_json(indent=2))
 						return {
 							'native_results': results,
@@ -459,7 +475,7 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 						result = {'error': f'{type(e).__name__}: {e}'}
 						metrics.error = result['error']
 					common.record_tool_exchange(
-						directory,
+						log_directory,
 						common.ToolExchange(
 							call_id=call.call_id, name=call.name, arguments=call.arguments, status=status, result=result
 						),
@@ -487,12 +503,13 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 			metrics.status, metrics.error = ('timeout', 'Task deadline reached')
 		except Exception as e:
 			metrics.status, metrics.error = 'error', f'{type(e).__name__}: {e}'
-		(directory / 'evidence-ledger.json').write_text(
-			json.dumps(
-				{'evidence': shared_ledger.evidence, 'citations': [c.model_dump() for c in shared_ledger.citations.values()]},
-				ensure_ascii=False,
+		if log_directory is not None:
+			(log_directory / 'evidence-ledger.json').write_text(
+				json.dumps(
+					{'evidence': shared_ledger.evidence, 'citations': [c.model_dump() for c in shared_ledger.citations.values()]},
+					ensure_ascii=False,
+				)
 			)
-		)
 	finally:
 		close_browser = browser.stop if browser.browser_profile.keep_alive else browser.kill
 		cleanup_errors = await asyncio.gather(parent.close(), decision.close(), close_browser(), return_exceptions=True)

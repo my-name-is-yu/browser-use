@@ -102,6 +102,14 @@ def test_cli_and_public_python_api_share_defaults(invoke):
 	assert calls[0][1] == public.WorkflowSettings()
 
 
+def test_cli_enables_diagnostic_logs_only_with_explicit_directory(invoke, tmp_path):
+	run, calls, _ = invoke
+	assert run(['--url', 'https://example.test/', '--goal', 'Read'])[0] == 0
+	assert calls[0][1].log_dir is None
+	assert run(['--url', 'https://example.test/', '--goal', 'Read', '--log-dir', str(tmp_path / 'logs')])[0] == 0
+	assert calls[1][1].log_dir == tmp_path / 'logs'
+
+
 @pytest.mark.parametrize('flag,headless', [('--visible', False), ('--headless', True)])
 def test_cli_explicit_browser_display(invoke, flag, headless):
 	run, calls, _ = invoke

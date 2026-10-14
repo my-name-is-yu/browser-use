@@ -57,7 +57,7 @@ class RequestUsage(BaseModel):
 class RequestTransport(httpx.AsyncBaseTransport):
 	"""Capture every physical HTTP attempt without storing authorization or request bodies."""
 
-	def __init__(self, role: Literal['parent', 'decisions'], requests: list[RequestUsage], ledger: Path, limit: int):
+	def __init__(self, role: Literal['parent', 'decisions'], requests: list[RequestUsage], ledger: Path | None, limit: int):
 		self.limit = limit
 		self.admitted_requests = 0
 		self.role = role
@@ -99,10 +99,11 @@ class RequestTransport(httpx.AsyncBaseTransport):
 			row['latency_seconds'] = time.monotonic() - start
 			event = RequestUsage.model_validate(row)
 			self.requests.append(event)
-			with self.ledger.open('a') as stream:
-				stream.write(event.model_dump_json() + '\n')
-				stream.flush()
-				os.fsync(stream.fileno())
+			if self.ledger is not None:
+				with self.ledger.open('a') as stream:
+					stream.write(event.model_dump_json() + '\n')
+					stream.flush()
+					os.fsync(stream.fileno())
 
 	async def aclose(self) -> None:
 		await self.inner.aclose()
@@ -118,8 +119,10 @@ class ToolExchange(BaseModel):
 	result: dict[str, Any] | list[dict[str, Any]]
 
 
-def record_tool_exchange(directory: Path, exchange: ToolExchange) -> None:
+def record_tool_exchange(directory: Path | None, exchange: ToolExchange) -> None:
 	"""Persist the exact response returned to the parent before another model call."""
+	if directory is None:
+		return
 	with (directory / 'tool-exchanges.jsonl').open('a') as stream:
 		stream.write(exchange.model_dump_json() + '\n')
 		stream.flush()

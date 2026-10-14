@@ -43,6 +43,7 @@ class DecisionRuntime:
 		timeout: float,
 		max_decisions: int,
 		output_dir: Path,
+		log_dir: Path | None = None,
 		navigate_to_start: bool = True,
 	):
 		if not 0 < timeout < float('inf') or max_decisions < 1:
@@ -55,6 +56,7 @@ class DecisionRuntime:
 		self.timeout = timeout
 		self.max_decisions = max_decisions
 		self.output_dir = Path(output_dir).resolve()
+		self.log_dir = Path(log_dir).resolve() if log_dir is not None else None
 		self.navigate_to_start = navigate_to_start
 		self.driver = None
 		self.result = None
@@ -74,9 +76,10 @@ class DecisionRuntime:
 
 	async def _event(self, event, **values):
 		assert self.result
-		data = {'event': event, 'at': time.time(), **values}
-		with (Path(self.result.directory) / 'journal.jsonl').open('a') as f:
-			f.write(json.dumps(data, ensure_ascii=False) + '\n')
+		if self.result.log_directory is not None:
+			data = {'event': event, 'at': time.time(), **values}
+			with (Path(self.result.log_directory) / 'journal.jsonl').open('a') as f:
+				f.write(json.dumps(data, ensure_ascii=False) + '\n')
 		if event in ('decision_started', 'dispatch', 'receipt', 'recovery_receipt', 'result'):
 			self._save()
 
@@ -134,9 +137,13 @@ class DecisionRuntime:
 			run_id = uuid4().hex
 			directory = self.output_dir / run_id
 			directory.mkdir(parents=True, mode=0o700)
+			log_directory = self.log_dir / run_id if self.log_dir is not None else None
+			if log_directory is not None:
+				log_directory.mkdir(parents=True, mode=0o700, exist_ok=True)
 			self.result = RunResult(
 				run_id=run_id,
 				directory=str(directory),
+				log_directory=str(log_directory) if log_directory is not None else None,
 				task=task,
 				initial_inputs=list(task.inputs),
 				budget=RunBudget(max_decisions=self.max_decisions, deadline_at=time.time() + self.timeout),

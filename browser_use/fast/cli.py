@@ -49,6 +49,7 @@ def main():
 	parser.add_argument('--max-decisions', type=int, default=defaults.max_decisions)
 	parser.add_argument('--parent-turns', type=int, default=defaults.parent_turn_budget)
 	parser.add_argument('--output-dir', type=Path, default=Path('.bu-fast/workflows'))
+	parser.add_argument('--log-dir', type=Path, help='Save detailed diagnostic logs under this directory')
 	parser.add_argument('--executable-path', default=defaults.executable_path)
 	connection = parser.add_mutually_exclusive_group()
 	connection.add_argument('--connect-chrome', action='store_true', help='Connect to running system Chrome')
@@ -90,6 +91,7 @@ def main():
 			deadline_seconds=args.timeout,
 			parent_turn_budget=args.parent_turns,
 			max_decisions=args.max_decisions,
+			log_dir=args.log_dir,
 			executable_path=args.executable_path,
 			headless=args.headless,
 			cdp_url=chrome_cdp_url() if args.connect_chrome else args.cdp_url,

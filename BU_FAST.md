@@ -44,9 +44,13 @@ uv run bu-fast --connect-chrome \
 
 別のChromeやリモートブラウザには、`--connect-chrome` の代わりに `--cdp-url HTTP_OR_WEBSOCKET_URL` を指定できます。接続時には `--visible`、`--headless`、`--executable-path` を併用できません。接続先のブラウザとタブは終了後も残します。Pythonでは `WorkflowSettings(cdp_url=..., tab_id=...)` で同じ接続経路を使えます。
 
-保存先には `result.json`、検証済み成果の `delivery.json` と `final.txt`、原文・観測・操作記録があり、`outputs` に `results.json`、`report.md` と要求されたCSVなどを保存します。表とCSVは同じセルから生成します。情報が不足する項目はnullにし、理由を残して未完了として保存します。
+成果物の保存先には `result.json`、検証済み成果の `delivery.json` と `final.txt` があり、`outputs` に `results.json`、`report.md` と要求されたCSVなどを保存します。表とCSVは同じセルから生成します。情報が不足する項目はnullにし、理由を残して未完了として保存します。
 
-引用検証は、そのURLで取得した原文と要求項目の対応を確認します。リンク先URLだけでは引用元と認めません。未検証の試行は `attempted-delivery-*.json` に保存し、最終回答には出しません。意味的な正しさを保証するものではありません。入力値と表示結果は観測状態ごとに保持します。操作結果が不明な場合は同じ操作を自動で再送せず、復旧でも期限・予算・元の要求を維持します。
+実行用の画像・状態JSON・復旧記録は、OSの一時領域に作る `bu-fast-workflow-*` に保存します。成果物側の `result.json` の `runtime_directory` で場所を確認できます。中断時の状態確認に使えるよう、終了直後には削除しません。一時領域の清掃後はこれらの記録を参照できなくなります。画像のPNG保存と状態JSON内の画像は従来どおりです。
+
+詳細ログは `--log-dir PATH` を指定した場合だけ、`PATH/<成果物の実行フォルダ名>/` に保存します。Pythonでは `WorkflowSettings(log_dir=Path(...))` で指定できます。対象は観測・判断の `journal.jsonl`、親モデル応答、ツール応答、HTTP計測、試行回答、原文・引用の証拠台帳です。保存先は成果物側の `result.json` の `log_directory` に記録します。ログを保存しなくても、探索・証拠検索・引用検証・復旧・要求予算の制限は同じ処理を使います。
+
+引用検証は、そのURLで取得した原文と要求項目の対応を確認します。リンク先URLだけでは引用元と認めません。未検証の試行は詳細ログを指定した場合に `attempted-delivery-*.json` に保存し、最終回答には出しません。意味的な正しさを保証するものではありません。入力値と表示結果は観測状態ごとに保持します。操作結果が不明な場合は同じ操作を自動で再送せず、復旧でも期限・予算・元の要求を維持します。
 
 ## 回帰確認
 

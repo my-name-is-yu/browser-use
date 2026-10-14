@@ -230,6 +230,12 @@ async def test_cited_delivery_saves_validated_outputs_and_closes_resources(tmp_p
 	assert (directory / 'final.txt').read_text() == delivery['final_answer']
 	assert delivery['final_answer'] in (directory / 'outputs/report.md').read_text()
 	assert result.parent_calls == 1
+	assert result.runtime_directory is not None
+	assert Path(result.runtime_directory).is_dir()
+	assert not Path(result.runtime_directory).is_relative_to(directory)
+	assert harness.runtime_options['output_dir'] == Path(result.runtime_directory) / 'runs'
+	assert harness.runtime_options['log_dir'] is None and result.log_directory is None
+	assert {path.name for path in directory.iterdir()} == {'outputs', 'result.json', 'delivery.json', 'final.txt'}
 	harness.browser.kill.assert_awaited_once()
 	harness.parent_close.assert_awaited_once()
 	harness.decision_close.assert_awaited_once()
@@ -237,18 +243,22 @@ async def test_cited_delivery_saves_validated_outputs_and_closes_resources(tmp_p
 
 async def test_forged_citation_is_rejected_then_valid_delivery_can_recover(tmp_path, harness):
 	harness.steps = [lambda m: cited(m, forged=True), cited]
-	result = await run_case(tmp_path, parent_turn_budget=2)
+	result = await run_case(tmp_path, parent_turn_budget=2, log_dir=tmp_path / 'logs')
 	assert (result.delivery is not None) and result.parent_calls == 2
-	exchanges = [json.loads(line) for line in (tmp_path / 'workflow/tool-exchanges.jsonl').read_text().splitlines()]
+	assert result.log_directory == str(tmp_path / 'logs/workflow')
+	assert harness.runtime_options['log_dir'] == tmp_path / 'logs/workflow/runs'
+	assert (tmp_path / 'logs/workflow/parent-00.json').is_file()
+	assert (tmp_path / 'logs/workflow/evidence-ledger.json').is_file()
+	exchanges = [json.loads(line) for line in (tmp_path / 'logs/workflow/tool-exchanges.jsonl').read_text().splitlines()]
 	assert exchanges[0]['status'] == 'error' and 'not offered' in exchanges[0]['result']['error']
 	assert exchanges[1]['status'] == 'completed'
 
 
 async def test_continue_does_not_save_terminal_delivery(tmp_path, harness):
 	harness.steps = [('complete_delivery', {'disposition': 'continue', 'records': [], 'issues': ['Need more evidence']}), cited]
-	result = await run_case(tmp_path, parent_turn_budget=2)
+	result = await run_case(tmp_path, parent_turn_budget=2, log_dir=tmp_path / 'logs')
 	assert result.delivery is not None
-	assert json.loads((tmp_path / 'workflow/attempted-delivery-00.json').read_text())['disposition'] == 'continue'
+	assert json.loads((tmp_path / 'logs/workflow/attempted-delivery-00.json').read_text())['disposition'] == 'continue'
 
 
 @pytest.mark.parametrize('tool,status', [('resume_browser', 'needs_input'), ('repair_browser', 'done')])
@@ -324,12 +334,13 @@ async def test_exploration_failure_still_closes_resources(tmp_path, harness, err
 	harness.browser.kill.assert_awaited_once()
 
 
-async def test_physical_parent_cap_rejects_extra_http_request(tmp_path):
+@pytest.mark.parametrize('save_logs', [False, True])
+async def test_physical_parent_cap_rejects_extra_http_request(tmp_path, save_logs):
 	from browser_use.fast.workflow_support import RequestTransport
 
 	dispatch = AsyncMock(return_value=httpx.Response(200, json={'usage': {'input_tokens': 2}}))
 	rows = []
-	transport = RequestTransport('parent', rows, tmp_path / 'http.jsonl', 2)
+	transport = RequestTransport('parent', rows, tmp_path / 'http.jsonl' if save_logs else None, 2)
 	transport.inner.handle_async_request = dispatch
 	try:
 		for _ in range(2):
@@ -341,6 +352,7 @@ async def test_physical_parent_cap_rejects_extra_http_request(tmp_path):
 				httpx.Request('POST', 'https://api.openai.com/v1/responses', json={'model': 'gpt-6.1-sol'})
 			)
 		assert dispatch.await_count == 2 and len(rows) == 2
+		assert (tmp_path / 'http.jsonl').exists() is save_logs
 	finally:
 		await transport.aclose()
 
@@ -390,12 +402,13 @@ async def test_shared_table_missing_field_saves_once_without_fabricated_value(tm
 	assert delivery['final_answer'].count('Contact') == 1
 
 
-async def test_unvalidated_attempt_never_becomes_final_output(tmp_path, harness):
+@pytest.mark.parametrize('save_logs', [False, True])
+async def test_unvalidated_attempt_never_becomes_final_output(tmp_path, harness, save_logs):
 	harness.steps = [lambda m: cited(m, forged=True)]
-	result = await run_case(tmp_path, parent_turn_budget=1)
+	result = await run_case(tmp_path, parent_turn_budget=1, log_dir=tmp_path / 'logs' if save_logs else None)
 	assert result.status == 'error' and result.delivery is None and 'not offered' in result.error
 	directory = tmp_path / 'workflow'
-	assert (directory / 'attempted-delivery-00.json').exists()
+	assert (tmp_path / 'logs/workflow/attempted-delivery-00.json').exists() is save_logs
 	assert not (directory / 'final.txt').exists() and not (directory / 'delivery.json').exists()
 	assert not (directory / 'outputs/report.md').exists()
 
