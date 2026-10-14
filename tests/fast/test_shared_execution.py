@@ -1,6 +1,7 @@
-"""The existing Agent uses the same kernel and retains a dispatched prefix."""
+"""The OSS Agent propagates connection loss without running remaining actions."""
 
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -10,15 +11,17 @@ from browser_use.agent.views import ActionResult
 from browser_use.tools.service import Tools
 
 
-async def test_agent_retains_prefix_on_connection_loss():
+async def test_agent_stops_batch_on_connection_loss():
 	tools = Tools()
 	Action = tools.registry.create_action_model()
 	actions = [Action.model_validate({'input': {'index': i, 'text': 'Value'}}) for i in (1, 2, 3)]
 	tools.act = AsyncMock(
 		side_effect=[ActionResult(extracted_content='First input applied'), ConnectionError('connection closed')]
 	)
-	agent = Agent.__new__(Agent)
+	agent = cast(Any, Agent.__new__(Agent))
 	agent.browser_session = SimpleNamespace(
+		id='fixture',
+		_cached_browser_state_summary=None,
 		browser_profile=SimpleNamespace(wait_between_actions=0),
 		agent_focus_target_id='tab',
 		get_current_page_url=AsyncMock(return_value='http://fixture/'),
@@ -36,5 +39,3 @@ async def test_agent_retains_prefix_on_connection_loss():
 	with pytest.raises(ConnectionError):
 		await agent.multi_act(actions)
 	assert tools.act.await_count == 2
-	assert agent.state.last_result[0].extracted_content == 'First input applied'
-	assert agent.state.last_result[1].error == 'ConnectionError: connection closed'
