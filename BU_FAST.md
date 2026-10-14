@@ -22,13 +22,27 @@ uv run bu-fast --url 'https://対象サイト/' --goal '要求全文'
 
 `--task PATH` では `id`、`start_url`、`goal`、`exact_input_values`、`required_fields` を持つWorkflowTask JSONを指定できます。`required_fields` は `id` と `requirement` の配列です。`--task` と `--url`・`--goal`・`--plan`・`--input` は併用できません。
 
-Pythonからは `from browser_use.fast import WorkflowTask, WorkflowSettings, run_workflow` で同じ実行経路を使えます。CLIとPythonの既定値は共通で、総期限は180秒、親要求は24回、Decisions要求は90回です。`--timeout`、`--parent-turns`、`--max-decisions` で変更できます。`--visible` でブラウザを表示し、`--executable-path` でChromeの実行ファイルを指定できます。`--env-file` の既定は `.env.local`、`--output-dir` の既定は `.bu-fast/workflows` です。
+Pythonからは `from browser_use.fast import WorkflowTask, WorkflowSettings, run_workflow` で同じ実行経路を使えます。CLIとPythonの既定値は共通で、総期限は180秒、親要求は24回、Decisions要求は90回です。`--timeout`、`--parent-turns`、`--max-decisions` で変更できます。ブラウザの既定値はBrowser Use本体から引き継ぎ、画面表示は環境変数 `BROWSER_USE_HEADLESS`、未指定ならディスプレイの有無で決まります。`--visible` で表示、`--headless` で非表示を明示し、`--executable-path` でChromeの実行ファイルを指定できます。Pythonでは `WorkflowSettings(browser_profile=BrowserProfile(...))` で本体のブラウザ設定を渡せます。`keep_alive=True` なら終了後もブラウザを残します。`--env-file` の既定は `.env.local`、`--output-dir` の既定は `.bu-fast/workflows` です。
 
 ## 実行経路と保存結果
 
 `run_workflow → LedgerExplorer → DecisionRuntime` が、探索、必要な入力の補完、保存済み原文の検索、復旧、引用検証、回答とファイルの保存を同じ予算内で実行します。ブラウザは専用に起動します。
 
 stdoutのJSONに `status`、`directory`、`final_answer`、`error` を返します。`status=complete` は引用検証とファイル保存が済んだ完成状態で、終了コード0です。情報不足は `incomplete`、失敗は `error`、期限切れは `timeout`、中断は `interrupted` です。完成以外は終了コード2、中断は終了コード130です。
+
+## 今開いているChromeのタブを使う
+
+Chromeの `chrome://inspect/#remote-debugging` で接続を許可した後、`--connect-chrome` を付けます。システムChromeの `DevToolsActivePort` から接続先を検出します。Chromeが接続許可を求めた場合はChrome上で承認します。
+
+```sh
+uv run bu-fast --connect-chrome \
+  --url 'https://librosa.org/doc/latest/api/index.html' \
+  --goal '同じタブでCore functionalityを開き、見出しとURLを報告して'
+```
+
+接続時の `--url` は、操作対象の既存タブの現在のURLと完全一致させます。タブを再読み込みせず、現在のページ状態から操作を始めます。一致するタブがない場合や複数ある場合は操作せず終了します。同じURLのタブが複数ある場合は、エラーに表示される対象IDを `--tab-id ID` で指定します。
+
+別のChromeやリモートブラウザには、`--connect-chrome` の代わりに `--cdp-url HTTP_OR_WEBSOCKET_URL` を指定できます。接続時には `--visible`、`--headless`、`--executable-path` を併用できません。接続先のブラウザとタブは終了後も残します。Pythonでは `WorkflowSettings(cdp_url=..., tab_id=...)` で同じ接続経路を使えます。
 
 保存先には `result.json`、検証済み成果の `delivery.json` と `final.txt`、原文・観測・操作記録があり、`outputs` に `results.json`、`report.md` と要求されたCSVなどを保存します。表とCSVは同じセルから生成します。情報が不足する項目はnullにし、理由を残して未完了として保存します。
 
@@ -40,4 +54,4 @@ stdoutのJSONに `status`、`directory`、`final_answer`、`error` を返しま�
 uv run --no-sync pytest tests/fast -q -o addopts='' -o log_cli=false
 ```
 
-テストは通常CLI、本体の探索・復旧・停止、証拠保持、引用、欠損値、表・CSV保存を確認します。過去の比較実装・評価データ・旧CLIは保持していません。
+テストは通常CLI、既存Chromeの接続先検出・タブ選択・再読み込み防止・終了後の保持、本体の探索・復旧・停止、証拠保持、引用、欠損値、表・CSV保存を確認します。過去の比較実装・評価データ・旧CLIは保持していません。

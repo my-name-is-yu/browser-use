@@ -6,6 +6,7 @@ import os
 import time
 from pathlib import Path
 from typing import Literal, cast
+from urllib.parse import urlparse
 
 import httpx
 from openai import AsyncOpenAI
@@ -13,7 +14,8 @@ from openai.types.responses import ToolParam
 from pydantic import Field, model_validator
 
 from browser_use.actor.page import Page
-from browser_use.browser.profile import BrowserProfile, ViewportSize
+from browser_use.browser.events import SwitchTabEvent
+from browser_use.browser.profile import BrowserProfile
 from browser_use.browser.session import BrowserSession
 from browser_use.fast import workflow_support as common
 from browser_use.fast.decisions import DecisionClient
@@ -48,7 +50,24 @@ class WorkflowSettings(Contract):
 	parent_turn_budget: int = Field(default=24, ge=1)
 	max_decisions: int = Field(default=90, ge=1)
 	executable_path: str | None = None
-	headless: bool = True
+	headless: bool | None = None
+	browser_profile: BrowserProfile | None = None
+	cdp_url: str | None = None
+	tab_id: str | None = None
+
+	@model_validator(mode='after')
+	def validate_connection(self):
+		"""Reject tab selection without a connection and conflicting launch options."""
+		endpoint = self.cdp_url or (self.browser_profile.cdp_url if self.browser_profile else None)
+		if endpoint:
+			parsed = urlparse(endpoint)
+			if parsed.scheme not in ('http', 'https', 'ws', 'wss') or not parsed.hostname:
+				raise ValueError('CDP connection requires an absolute HTTP(S) or WebSocket URL')
+			if self.headless is not None or self.executable_path is not None:
+				raise ValueError('Existing browser connections cannot use launch or display options')
+		elif self.tab_id:
+			raise ValueError('--tab-id requires an existing browser connection')
+		return self
 
 
 class ResumeBrowser(Contract):
@@ -149,16 +168,12 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 		http_client=httpx.AsyncClient(transport=RequestTransport('parent', requests, ledger, settings.parent_turn_budget)),
 	)
 	decision = DecisionClient(transport=RequestTransport('decisions', requests, ledger, settings.max_decisions))
+	attached = bool(settings.cdp_url or (settings.browser_profile and settings.browser_profile.cdp_url))
+	# Leave unspecified browser options to Browser Use, including environment defaults.
 	browser = BrowserSession(
-		browser_profile=BrowserProfile(
-			headless=settings.headless,
-			executable_path=settings.executable_path,
-			user_data_dir=None,
-			keep_alive=True,
-			enable_default_extensions=False,
-			captcha_solver=False,
-			viewport=ViewportSize(width=1280, height=900),
-		)
+		browser_profile=settings.browser_profile,
+		**settings.model_dump(include={'headless', 'executable_path', 'cdp_url'}, exclude_none=True),
+		keep_alive=True if attached else None,
 	)
 	try:
 		metrics = WorkflowResult(task=task_data['id'], directory=str(directory.resolve()))
@@ -185,6 +200,21 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 
 		try:
 			await asyncio.wait_for(browser.start(), max(0, deadline - time.monotonic()))
+			if attached:
+				tabs = await browser.get_tabs()
+				matches = [
+					tab
+					for tab in tabs
+					if tab.url == task.start_url and (settings.tab_id is None or tab.target_id == settings.tab_id)
+				]
+				if len(matches) != 1:
+					raise ValueError(
+						f'Expected one existing tab matching the task URL and --tab-id; found {len(matches)}. '
+						f'Matching target IDs: {[tab.target_id for tab in matches]}'
+					)
+				await browser.event_bus.dispatch(SwitchTabEvent(target_id=matches[0].target_id))
+				if browser.agent_focus_target_id != matches[0].target_id:
+					raise RuntimeError('Could not focus the selected existing tab')
 			assert browser.agent_focus_target_id
 			page = Page(browser, browser.agent_focus_target_id)
 			driver = BrowserDriver(page, browser.agent_focus_target_id)
@@ -197,6 +227,7 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 				output_dir=directory / 'runs',
 				plan=PurposePlan(conditions=task_data['required_fields']),
 				ledger=shared_ledger,
+				navigate_to_start=not attached,
 			)
 			last = await runtime.run(
 				BrowserTask(url=task_data['start_url'], goal=task_data['goal'], inputs=task_data['exact_input_values'])
@@ -236,7 +267,7 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 				packet['texts'] = {key: text for key, text in packet['texts'].items() if key not in parent_texts_sent}
 				parent_texts_sent.update(packet['texts'])
 				packet['previously_attached_count'] = len(parent_citations_sent)
-				parent_citations_sent.update((c['id'] for c in packet['citations']))
+				parent_citations_sent.update(c['id'] for c in packet['citations'])
 				messages.append({'role': 'user', 'content': json.dumps({'retained_sources': packet}, ensure_ascii=False)})
 				response = await asyncio.wait_for(
 					parent.responses.create(
@@ -255,7 +286,7 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 				(directory / f'parent-{turn:02d}.json').write_text(response.model_dump_json())
 				if response.status != 'completed':
 					raise RuntimeError('Incomplete parent output')
-				messages.extend((i.model_dump(exclude_none=True) for i in response.output))
+				messages.extend(i.model_dump(exclude_none=True) for i in response.output)
 				calls = [i for i in response.output if i.type == 'function_call']
 				if not calls:
 					messages.append(
@@ -293,7 +324,7 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 						).model_dump()
 						packet['texts'] = {key: text for key, text in packet['texts'].items() if key not in parent_texts_sent}
 						parent_texts_sent.update(packet['texts'])
-						parent_citations_sent.update((c['id'] for c in packet['citations']))
+						parent_citations_sent.update(c['id'] for c in packet['citations'])
 						return packet
 					if call.name == 'write_artifact':
 						data = common.WriteArtifact.model_validate_json(call.arguments)
@@ -360,8 +391,8 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 						blocked_run
 						and (not metrics.unknown_operation_effect)
 						and (len(results) == len(batch.actions))
-						and all((result.get('ok') for result in results))
-						and any((action.op not in ('read', 'extract', 'wait') for action in batch.actions))
+						and all(result.get('ok') for result in results)
+						and any(action.op not in ('read', 'extract', 'wait') for action in batch.actions)
 					):
 						from browser_use.fast.views import RecoveryAction, RecoveryReceipt
 
@@ -463,7 +494,8 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 			)
 		)
 	finally:
-		cleanup_errors = await asyncio.gather(parent.close(), decision.close(), browser.kill(), return_exceptions=True)
+		close_browser = browser.stop if browser.browser_profile.keep_alive else browser.kill
+		cleanup_errors = await asyncio.gather(parent.close(), decision.close(), close_browser(), return_exceptions=True)
 		failures = [str(error) for error in cleanup_errors if isinstance(error, BaseException)]
 		if failures:
 			metrics.status, metrics.error = 'error', 'Cleanup failed: ' + '; '.join(failures)

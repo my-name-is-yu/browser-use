@@ -3,12 +3,14 @@
 import asyncio
 import json
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
+from browser_use.browser.session import BrowserSession
 from browser_use.fast import workflow
 from browser_use.fast.views import Observation, RunBudget, RunResult
 
@@ -17,9 +19,20 @@ from browser_use.fast.views import Observation, RunBudget, RunResult
 def harness(tmp_path, monkeypatch):
 	monkeypatch.setenv('OPENAI_API_KEY', 'test-key')
 	page = SimpleNamespace(goto=AsyncMock())
-	browser = SimpleNamespace(start=AsyncMock(), kill=AsyncMock(), agent_focus_target_id='tab')
+	browser = SimpleNamespace(start=AsyncMock(), kill=AsyncMock(), stop=AsyncMock(), agent_focus_target_id='tab')
+	browser.get_tabs = AsyncMock(return_value=[SimpleNamespace(target_id='existing', url='https://example.test/')])
+
+	async def switch_tab(event):
+		browser.agent_focus_target_id = event.target_id
+
+	browser.event_bus = SimpleNamespace(dispatch=AsyncMock(side_effect=switch_tab))
 	parent_close, decision_close = AsyncMock(), AsyncMock()
-	monkeypatch.setattr(workflow, 'BrowserSession', lambda **kw: browser)
+
+	def create_browser(browser_profile, **options):
+		browser.browser_profile = BrowserSession(browser_profile=browser_profile, **options).browser_profile
+		return browser
+
+	monkeypatch.setattr(workflow, 'BrowserSession', create_browser)
 	monkeypatch.setattr(workflow, 'Page', lambda *a: page)
 	monkeypatch.setattr(workflow, 'DecisionClient', lambda **kw: SimpleNamespace(close=decision_close))
 	observation = Observation(
@@ -45,11 +58,13 @@ def harness(tmp_path, monkeypatch):
 		steps=[],
 		status='done',
 		startup_error=None,
+		runtime_options=None,
 	)
 
 	class Runtime:
 		def __init__(self, *args, **options):
 			self.options = options
+			state.runtime_options = options
 
 		async def run(self, task=None, **options):
 			state.calls.append((task, options))
@@ -127,6 +142,80 @@ async def run_case(tmp_path, **settings):
 		required_fields=[{'id': 'answer', 'requirement': 'Observed source fact'}],
 	)
 	return await workflow.run_workflow(task, tmp_path / 'workflow', workflow.WorkflowSettings(**settings))
+
+
+async def test_browser_inherits_upstream_environment_and_profile_defaults(tmp_path, harness, monkeypatch):
+	monkeypatch.setenv('BROWSER_USE_HEADLESS', 'true')
+	monkeypatch.delenv('BROWSER_USE_DISABLE_EXTENSIONS', raising=False)
+	harness.steps = [cited]
+	assert (await run_case(tmp_path)).status == 'complete'
+	profile = harness.browser.browser_profile
+	upstream = BrowserSession().browser_profile
+	for name in ('headless', 'keep_alive', 'enable_default_extensions', 'captcha_solver', 'viewport'):
+		assert getattr(profile, name) == getattr(upstream, name)
+	assert profile.user_data_dir is not None and upstream.user_data_dir is not None
+	assert Path(profile.user_data_dir).parent == Path(upstream.user_data_dir).parent
+	assert profile.headless is True and profile.enable_default_extensions is True
+
+
+async def test_explicit_browser_options_override_environment_and_keep_browser_alive(tmp_path, harness, monkeypatch):
+	monkeypatch.setenv('BROWSER_USE_HEADLESS', 'true')
+	harness.steps = [cited]
+	profile = workflow.BrowserProfile(keep_alive=True, enable_default_extensions=False)
+	assert (await run_case(tmp_path, headless=False, browser_profile=profile)).status == 'complete'
+	assert harness.browser.browser_profile.headless is False
+	assert harness.browser.browser_profile.enable_default_extensions is False
+	harness.browser.kill.assert_not_awaited()
+	harness.browser.stop.assert_awaited_once()
+	harness.parent_close.assert_awaited_once()
+	harness.decision_close.assert_awaited_once()
+
+
+async def test_existing_browser_selects_matching_tab_without_navigation_and_stays_open(tmp_path, harness):
+	harness.steps = [cited]
+	result = await run_case(tmp_path, cdp_url='ws://127.0.0.1:9222/devtools/browser/test')
+	assert result.status == 'complete'
+	assert harness.runtime_options['target_id'] == 'existing'
+	assert harness.runtime_options['navigate_to_start'] is False
+	assert harness.browser.agent_focus_target_id == 'existing'
+	harness.browser.kill.assert_not_awaited()
+	harness.browser.stop.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+	'tabs',
+	[
+		[],
+		[
+			SimpleNamespace(target_id='a', url='https://example.test/'),
+			SimpleNamespace(target_id='b', url='https://example.test/'),
+		],
+	],
+)
+async def test_existing_browser_rejects_missing_or_ambiguous_tab_without_operations(tmp_path, harness, tabs):
+	harness.browser.get_tabs.return_value = tabs
+	result = await run_case(tmp_path, cdp_url='http://127.0.0.1:9222')
+	assert result.status == 'error' and result.error is not None and 'Expected one existing tab' in result.error
+	assert not harness.calls
+	harness.browser.event_bus.dispatch.assert_not_awaited()
+	harness.browser.kill.assert_not_awaited()
+	harness.browser.stop.assert_awaited_once()
+
+
+async def test_existing_browser_target_id_disambiguates_matching_urls(tmp_path, harness):
+	harness.browser.get_tabs.return_value = [SimpleNamespace(target_id=t, url='https://example.test/') for t in ('a', 'b')]
+	harness.steps = [cited]
+	result = await run_case(tmp_path, cdp_url='http://127.0.0.1:9222', tab_id='b')
+	assert result.status == 'complete'
+	assert harness.runtime_options['target_id'] == 'b'
+
+
+async def test_profile_cdp_connection_also_preserves_external_browser(tmp_path, harness):
+	harness.steps = [cited]
+	profile = workflow.BrowserProfile(cdp_url='http://127.0.0.1:9222', keep_alive=False)
+	assert (await run_case(tmp_path, browser_profile=profile)).status == 'complete'
+	harness.browser.kill.assert_not_awaited()
+	harness.browser.stop.assert_awaited_once()
 
 
 @pytest.mark.parametrize('missing', [False, True])

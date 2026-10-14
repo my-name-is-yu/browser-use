@@ -43,6 +43,7 @@ class DecisionRuntime:
 		timeout: float,
 		max_decisions: int,
 		output_dir: Path,
+		navigate_to_start: bool = True,
 	):
 		if not 0 < timeout < float('inf') or max_decisions < 1:
 			raise ValueError('Positive finite time and request budgets required')
@@ -54,6 +55,7 @@ class DecisionRuntime:
 		self.timeout = timeout
 		self.max_decisions = max_decisions
 		self.output_dir = Path(output_dir).resolve()
+		self.navigate_to_start = navigate_to_start
 		self.driver = None
 		self.result = None
 
@@ -156,7 +158,7 @@ class DecisionRuntime:
 						receipt=recovery.model_dump(exclude={'before': {'screenshot'}, 'after': {'screenshot'}}),
 					)
 					await self._event('observed', observation=recovery.after.model_dump(exclude={'screenshot'}))
-				if not resume:
+				if not resume and self.navigate_to_start:
 					await self.driver.page.goto(r.task.url)
 					await self._event('navigation', url=r.task.url)
 				unchanged = 0

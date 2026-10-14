@@ -10,6 +10,29 @@ from dotenv import load_dotenv
 from pydantic import ValidationError
 
 
+def chrome_cdp_url() -> str:
+	"""Discover the running system Chrome's permission-controlled CDP endpoint."""
+	from browser_use.browser.chrome import get_chrome_profile_path
+
+	profile = get_chrome_profile_path(None)
+	if profile is None:
+		raise ValueError('Cannot locate Chrome profile; provide --cdp-url')
+	try:
+		lines = (Path(profile) / 'DevToolsActivePort').read_text().splitlines()
+	except OSError:
+		raise ValueError(
+			'Chrome connection unavailable; enable chrome://inspect/#remote-debugging or provide --cdp-url'
+		) from None
+	if (
+		len(lines) != 2
+		or not lines[0].isdigit()
+		or not 1 <= int(lines[0]) <= 65535
+		or not lines[1].startswith('/devtools/browser/')
+	):
+		raise ValueError('Invalid Chrome discovery file; provide --cdp-url')
+	return f'ws://127.0.0.1:{lines[0]}{lines[1]}'
+
+
 def main():
 	from browser_use.fast.exploration import PurposeCondition, PurposePlan
 	from browser_use.fast.workflow import WorkflowSettings, WorkflowTask, run_workflow
@@ -27,7 +50,13 @@ def main():
 	parser.add_argument('--parent-turns', type=int, default=defaults.parent_turn_budget)
 	parser.add_argument('--output-dir', type=Path, default=Path('.bu-fast/workflows'))
 	parser.add_argument('--executable-path', default=defaults.executable_path)
-	parser.add_argument('--visible', action='store_true')
+	connection = parser.add_mutually_exclusive_group()
+	connection.add_argument('--connect-chrome', action='store_true', help='Connect to running system Chrome')
+	connection.add_argument('--cdp-url', help='Existing browser CDP HTTP or WebSocket URL')
+	parser.add_argument('--tab-id', help='Exact target ID when multiple tabs have the supplied --url')
+	display = parser.add_mutually_exclusive_group()
+	display.add_argument('--visible', dest='headless', action='store_const', const=False, default=defaults.headless)
+	display.add_argument('--headless', dest='headless', action='store_const', const=True)
 	args = parser.parse_args()
 
 	try:
@@ -62,11 +91,15 @@ def main():
 			parent_turn_budget=args.parent_turns,
 			max_decisions=args.max_decisions,
 			executable_path=args.executable_path,
-			headless=not args.visible,
+			headless=args.headless,
+			cdp_url=chrome_cdp_url() if args.connect_chrome else args.cdp_url,
+			tab_id=args.tab_id,
 		)
 	except ValidationError as error:
 		parser.error('; '.join(item['msg'] for item in error.errors(include_input=False, include_url=False)))
 	except OSError as error:
+		parser.error(str(error))
+	except ValueError as error:
 		parser.error(str(error))
 	load_dotenv(args.env_file, override=True)
 	directory = args.output_dir / uuid.uuid4().hex

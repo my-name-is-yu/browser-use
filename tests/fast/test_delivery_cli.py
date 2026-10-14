@@ -102,6 +102,71 @@ def test_cli_and_public_python_api_share_defaults(invoke):
 	assert calls[0][1] == public.WorkflowSettings()
 
 
+@pytest.mark.parametrize('flag,headless', [('--visible', False), ('--headless', True)])
+def test_cli_explicit_browser_display(invoke, flag, headless):
+	run, calls, _ = invoke
+	assert run(['--url', 'https://example.test/', '--goal', 'Read', flag])[0] == 0
+	assert calls[0][1].headless is headless
+
+
+def test_cli_rejects_conflicting_display_flags(invoke):
+	run, calls, _ = invoke
+	assert run(['--url', 'https://example.test/', '--goal', 'Read', '--visible', '--headless'])[0] == 2
+	assert not calls
+
+
+def test_cli_connects_to_running_chrome(invoke, monkeypatch):
+	run, calls, _ = invoke
+	monkeypatch.setattr(cli, 'chrome_cdp_url', lambda: 'ws://127.0.0.1:9222/devtools/browser/test')
+	assert run(['--connect-chrome', '--url', 'https://example.test/', '--goal', 'Read'])[0] == 0
+	assert calls[0][1].cdp_url == 'ws://127.0.0.1:9222/devtools/browser/test'
+	assert calls[0][1].headless is None
+
+
+def test_cli_accepts_explicit_cdp_endpoint_and_target_id(invoke):
+	run, calls, _ = invoke
+	assert (
+		run(['--cdp-url', 'http://127.0.0.1:9222', '--tab-id', 'existing', '--url', 'https://example.test/', '--goal', 'Read'])[0]
+		== 0
+	)
+	assert calls[0][1].cdp_url == 'http://127.0.0.1:9222' and calls[0][1].tab_id == 'existing'
+
+
+@pytest.mark.parametrize(
+	'options',
+	[
+		['--tab-id', 'tab'],
+		['--cdp-url', 'file:///tmp/browser'],
+		['--cdp-url', 'http://localhost:9222', '--visible'],
+		['--cdp-url', 'http://localhost:9222', '--executable-path', '/usr/bin/chrome'],
+		['--cdp-url', 'http://localhost:9222', '--connect-chrome'],
+	],
+)
+def test_cli_rejects_invalid_connection_settings(invoke, options):
+	run, calls, _ = invoke
+	assert run(['--url', 'https://example.test/', '--goal', 'Read', *options])[0] == 2
+	assert not calls
+
+
+@pytest.mark.parametrize('contents', [None, '', '9222\n', '99999\n/devtools/browser/test\n', '9222\nnot-a-browser-endpoint\n'])
+def test_chrome_discovery_rejects_missing_or_invalid_file(tmp_path, monkeypatch, contents):
+	from browser_use.browser import chrome
+
+	monkeypatch.setattr(chrome, 'get_chrome_profile_path', lambda _: str(tmp_path))
+	if contents is not None:
+		(tmp_path / 'DevToolsActivePort').write_text(contents)
+	with pytest.raises(ValueError):
+		cli.chrome_cdp_url()
+
+
+def test_chrome_discovery_uses_websocket_endpoint(tmp_path, monkeypatch):
+	from browser_use.browser import chrome
+
+	monkeypatch.setattr(chrome, 'get_chrome_profile_path', lambda _: str(tmp_path))
+	(tmp_path / 'DevToolsActivePort').write_text('9222\n/devtools/browser/test\n')
+	assert cli.chrome_cdp_url() == 'ws://127.0.0.1:9222/devtools/browser/test'
+
+
 def test_public_api_exposes_the_adopted_workflow():
 	import browser_use.fast as public
 

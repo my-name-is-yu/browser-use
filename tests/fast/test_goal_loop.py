@@ -42,11 +42,19 @@ class Choices:
 		return Decision(answer=Answer(type='choice', name='action', choice=choice.value), latency_ms=1)
 
 
-def runtime(tmp_path, choices):
+def runtime(tmp_path, choices, *, navigate_to_start=True):
 	browser = SimpleNamespace(
 		cdp_url='http://browser', agent_focus_target_id='tab', start=AsyncMock(), stop=AsyncMock(), kill=AsyncMock()
 	)
-	r = DecisionRuntime(browser, target_id='tab', decisions=choices, timeout=180, max_decisions=90, output_dir=tmp_path)
+	r = DecisionRuntime(
+		browser,
+		target_id='tab',
+		decisions=choices,
+		timeout=180,
+		max_decisions=90,
+		output_dir=tmp_path,
+		navigate_to_start=navigate_to_start,
+	)
 
 	async def no_display_change(_):
 		await asyncio.Event().wait()
@@ -62,6 +70,14 @@ def runtime(tmp_path, choices):
 		),
 	)
 	return cast(Any, r)
+
+
+async def test_existing_tab_runs_from_current_state_without_reloading(tmp_path):
+	r = runtime(tmp_path, Choices('every requested'), navigate_to_start=False)
+	result = await r.run(BrowserTask(url='http://example.test/', goal='Read the current page'))
+	assert result.status == 'done'
+	r.driver.page.goto.assert_not_awaited()
+	assert result.observation.document_id == 'd'
 
 
 async def test_input_request_resume_retains_identity_and_budget(tmp_path):
