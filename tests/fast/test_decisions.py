@@ -6,7 +6,7 @@ import time
 import httpx
 import pytest
 
-from browser_use.fast import DecisionClient, DecisionError
+from browser_use.fast.decisions import DecisionClient, DecisionError
 from browser_use.fast.views import Choice, ChoiceQuestion
 
 QUESTION = ChoiceQuestion(

@@ -1,18 +1,5 @@
-"""Goal-driven browser loop with input handoff to Codex."""
+"""Complete browser goals through the same workflow used by the CLI."""
 
-from browser_use.fast.decisions import DecisionClient, DecisionError
-from browser_use.fast.delivery import CompleteDelivery, DeliveryReceipt, ResultRecord, complete_run
-from browser_use.fast.session import DecisionRuntime
-from browser_use.fast.views import BrowserTask, RunResult
+from browser_use.fast.workflow import WorkflowResult, WorkflowSettings, WorkflowTask, run_workflow
 
-__all__ = [
-	'BrowserTask',
-	'CompleteDelivery',
-	'DecisionClient',
-	'DecisionError',
-	'DecisionRuntime',
-	'DeliveryReceipt',
-	'ResultRecord',
-	'RunResult',
-	'complete_run',
-]
+__all__ = ['WorkflowResult', 'WorkflowSettings', 'WorkflowTask', 'run_workflow']

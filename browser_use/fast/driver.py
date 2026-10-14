@@ -2,11 +2,12 @@
 
 import asyncio
 import json
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 from uuid import uuid4
 
 from browser_use.actor.page import Page
-from browser_use.fast.views import Action, Observation
+from browser_use.fast.views import Action, DisplayChange, Observation
+from browser_use.fast.workflow_support import native_selector_element
 
 OBSERVE = r"""(cfg) => {
 const norm = s => (s || '').replace(/\s+/g, ' ').trim();
@@ -38,7 +39,13 @@ for(const region of rootsOf(root)){const w=document.createTreeWalker(region,Node
 while((n=w.nextNode())&&count++<20000){
 if(!norm(n.textContent)||!rendered(n.parentElement))continue;
 const range=document.createRange();range.selectNodeContents(n);const r=range.getBoundingClientRect();
-if(r.height>0&&r.bottom>0&&r.top<innerHeight&&r.right>0&&r.left<innerWidth)texts.push(norm(n.textContent));
+let top=Math.max(0,r.top),bottom=Math.min(innerHeight,r.bottom),left=Math.max(0,r.left),right=Math.min(innerWidth,r.right);
+for(let e=n.parentElement;e;e=e.parentElement||e.getRootNode().host){
+const s=getComputedStyle(e),b=e.getBoundingClientRect();
+if(['hidden','clip','scroll','auto'].includes(s.overflowY)){top=Math.max(top,b.top+e.clientTop);bottom=Math.min(bottom,b.top+e.clientTop+e.clientHeight)}
+if(['hidden','clip','scroll','auto'].includes(s.overflowX)){left=Math.max(left,b.left+e.clientLeft);right=Math.min(right,b.left+e.clientLeft+e.clientWidth)}
+}
+if(bottom>top&&right>left)texts.push(norm(n.textContent));
 }
 }
 let fragment='';
@@ -53,6 +60,7 @@ fragment=norm(parts.join(' ')).slice(0,12000);
 }
 }catch{}
 const fullText=textOf(root);
+document.__buDisplaySnapshot={id:cfg.id,text:fullText,read:()=>textOf(root.isConnected?root:(document.body||document)),roots:()=>rootsOf(root)};
 const headings=deep(root,'h1,h2,h3,h4,h5,h6,dt').filter(rendered).slice(0,2000).map(e=>({text:norm(e.innerText),id:e.id||''}));
 const links=deep(root,'a[href]').filter(rendered).slice(0,2000).map(e=>({text:norm(e.innerText),href:e.href,context:norm((e.closest('li,tr,[role=row]')||e.parentElement)?.innerText).slice(0,1000)}));
 return {id:cfg.id,document_id:document.__buDocument,target_id:cfg.target,url:location.href,title:document.title,text:fullText.slice(0,200000),text_truncated:fullText.length>200000,viewport_text:texts.join('\n').slice(0,12000),fragment_text:fragment,targets,total_targets:all.length,focused:document.__buFocused()?.getAttribute('data-bu-ref')||'',scroll_y:scrollY,modal:!!modal,ready:document.readyState,headings,links};
@@ -78,6 +86,44 @@ class BrowserDriver:
 			observation.screenshot = await self.page.screenshot()
 		return observation
 
+	async def watch_display_change(self, observation: Observation) -> DisplayChange:
+		"""Race visible text changes against a decision; never wait for a quiet interval."""
+		try:
+			result = await self.page.evaluate(
+				r"""(c) => {
+const source=document.__buDisplaySnapshot;
+if(!source||source.id!==c.id||document.__buDocument!==c.document_id||location.href!==c.url)return {reason:'observation_replaced'};
+document.__buDisplayWatch?.stop();
+return new Promise(resolve=>{
+let ended=false;
+const finish=reason=>{if(ended)return;ended=true;observer.disconnect();
+if(document.__buDisplayWatch?.id===c.id)delete document.__buDisplayWatch;resolve({reason})};
+const check=()=>{if(source.read()!==source.text)finish('changed')};
+const observer=new MutationObserver(check);
+const options={subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['hidden','style','class','aria-hidden','open']};
+observer.observe(document,options);
+for(const root of source.roots())observer.observe(root,options);
+document.__buDisplayWatch={id:c.id,stop:()=>finish('stopped')};
+check();
+});
+}""",
+				{'id': observation.id, 'document_id': observation.document_id, 'url': observation.url},
+			)
+			return DisplayChange.model_validate_json(result)
+		except Exception:
+			# A destroyed document or failed watcher cannot validate an old decision.
+			return DisplayChange(reason='monitor_failed')
+
+	async def stop_display_watch(self, observation: Observation) -> None:
+		"""Release the page observer and its promise when the decision wins the race."""
+		try:
+			async with asyncio.timeout(1):
+				await self.page.evaluate(
+					'(id) => {if(document.__buDisplayWatch?.id===id)document.__buDisplayWatch.stop()}', observation.id
+				)
+		except Exception:
+			pass  # Navigation may already have destroyed the watched document.
+
 	async def execute(self, action: Action, observation: Observation) -> None:
 		"""Rebind the observed node, then click natively so SPA event handlers execute."""
 		if action.observation_id != observation.id:
@@ -93,6 +139,29 @@ class BrowserDriver:
 		)
 		if not json.loads(fresh)['passed']:
 			raise StaleTarget('Document or focused field changed')
+		if action.op == 'navigate':
+			link = next((link for link in observation.links if link['href'] == action.text), None)
+			if not link or urlparse(action.text).scheme not in ('http', 'https'):
+				raise StaleTarget('Navigation URL was not observed')
+			valid = await self.page.evaluate(
+				r"""(c) => {
+const norm=s=>(s||'').replace(/\s+/g,' ').trim(),roots=[document];
+for(let i=0;i<roots.length;i++)for(const e of roots[i].querySelectorAll('*'))if(e.shadowRoot)roots.push(e.shadowRoot);
+const links=[...new Set(roots.flatMap(r=>[...r.querySelectorAll('a[href]')]))];
+const index=links.findIndex(e=>e.href===c.href&&norm(e.innerText)===c.text&&norm((e.closest('li,tr,[role=row]')||e.parentElement)?.innerText).slice(0,1000)===c.context);
+return {passed:index>=0,index,new_tab:index>=0&&links[index].getAttribute('target')==='_blank'};
+}""",
+				link,
+			)
+			bound = json.loads(valid)
+			if not bound['passed']:
+				raise StaleTarget('Observed link meaning changed')
+			if bound['new_tab']:
+				await self.page.goto(action.text)
+			else:
+				element = await native_selector_element(self.page, 'a[href]', bound['index'])
+				await element.click()
+			return
 		if action.ref:
 			target = next((t for t in observation.targets if t.ref == action.ref), None)
 			if target is None:
@@ -110,6 +179,11 @@ return {passed:e.tagName.toLowerCase()===c.tag&&label===c.label&&(e.getAttribute
 			)
 			if not json.loads(valid)['passed']:
 				raise StaleTarget('Node meaning or document changed')
+			if action.op == 'click' and target.new_tab and target.href:
+				url = urljoin(observation.url, target.href)
+				if urlparse(url).scheme in ('http', 'https'):
+					await self.page.goto(url)
+					return
 			client = self.page.dom_service.browser_session.cdp_client
 			session_id = await self.page.session_id
 			await client.send.DOM.getDocument({'depth': 0, 'pierce': True}, session_id=session_id)
@@ -127,14 +201,31 @@ return {passed:e.tagName.toLowerCase()===c.tag&&label===c.label&&(e.getAttribute
 				await client.send.Runtime.releaseObject({'objectId': object_id}, session_id=session_id)
 			if action.op == 'fill':
 				await element.fill(action.text)
+				await self.page.evaluate('(c) => document.__buTargets.get(c.ref).focus()', {'ref': action.ref})
 			elif action.op == 'select':
 				await element.select_option(action.text)
-			elif target.new_tab and target.href and urlparse(urljoin(observation.url, target.href)).scheme in ('http', 'https'):
-				await self.page.goto(urljoin(observation.url, target.href))
-			else:
+			elif action.op == 'click':
 				await element.click()
+			else:
+				raise ValueError('Unsupported target operation')
 		elif action.op == 'enter':
+			if observation.focused:
+				target = next((t for t in observation.targets if t.ref == observation.focused), None)
+				valid = await self.page.evaluate(
+					'(c) => {const e=document.__buTargets?.get(c.ref);return {passed:!!e&&e.isConnected&&(e.value||"")===c.value}}',
+					{'ref': observation.focused, 'value': target.value if target else ''},
+				)
+				if target is None or not json.loads(valid)['passed']:
+					raise StaleTarget('Focused input changed before form submission')
 			await self.page.press('Enter')
+		elif action.op == 'read_page':
+			if not any(h.get('id') == action.text for h in observation.headings):
+				raise StaleTarget('Section was not observed')
+			await self.page.evaluate(
+				'(c) => {const e=document.getElementById(c.id);if(!e)throw Error("Section disappeared");for(let p=e;p;p=p.parentElement)if(p.tagName==="DETAILS")p.open=true;e.scrollIntoView();}',
+				{'id': action.text},
+			)
+			await self.page.goto(observation.url.split('#')[0] + '#' + quote(action.text))
 		elif action.op == 'escape':
 			await self.page.press('Escape')
 		elif action.op == 'back':

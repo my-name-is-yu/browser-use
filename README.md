@@ -1,4 +1,4 @@
-> **bu-fast fork:** Codex supplies a goal; OpenAI Decisions runs the browser loop and returns to Codex only when new input text is needed. Start with [BU_FAST.md](BU_FAST.md) and [the Codex Skill](skills/bu-fast/SKILL.md). The upstream Browser Use documentation follows.
+> **bu-fast fork:** Run a browser goal through exploration, cited answers and requested file delivery with `uv run bu-fast`. Start with [BU_FAST.md](BU_FAST.md) and [the Codex Skill](skills/bu-fast/SKILL.md). The upstream Browser Use documentation follows.
 
 <!-- mcp-name: com.browser-use/browser-use -->
 <picture>

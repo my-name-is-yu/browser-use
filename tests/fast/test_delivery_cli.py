@@ -1,88 +1,131 @@
-"""The adopted CLI saves cited outputs without reopening the browser or calling a model."""
+"""The default CLI preserves the goal and reports validated completion."""
 
 import json
 import sys
 
 import pytest
 
-from browser_use.fast import cli
-from browser_use.fast.delivery import CompleteDelivery, ResultRecord, complete_run
-from browser_use.fast.views import BrowserTask, Observation, RunBudget, RunResult
+from browser_use.fast import cli, workflow
+from browser_use.fast.delivery import CompleteDelivery
 
 
 @pytest.fixture
-def saved_delivery(tmp_path):
-	observation = Observation(
-		id='observed',
-		document_id='document',
-		target_id='tab',
-		url='https://example.test/',
-		title='Result',
-		text='Applied result',
-		viewport_text='Applied result',
-		targets=[],
-		total_targets=0,
+def invoke(tmp_path, monkeypatch, capsys):
+	calls = []
+
+	async def execute(task, directory, settings):
+		calls.append((task, settings))
+		directory.mkdir(parents=True)
+		return workflow.WorkflowResult(
+			task=task.id,
+			directory=str(directory.resolve()),
+			status=status[0],
+			delivery=CompleteDelivery(
+				disposition=status[0], browser_summary='', records=[], issues=[], final_answer='Observed result'
+			)
+			if status[0] in ('complete', 'incomplete')
+			else None,
+		)
+
+	status = ['complete']
+
+	monkeypatch.setattr(workflow, 'run_workflow', execute)
+	monkeypatch.setattr(cli, 'load_dotenv', lambda *a, **kw: None)
+
+	def run(arguments):
+		monkeypatch.setattr(sys, 'argv', ['bu-fast', *arguments, '--output-dir', str(tmp_path / 'outputs')])
+		with pytest.raises(SystemExit) as result:
+			cli.main()
+		output = capsys.readouterr()
+		return result.value.code, json.loads(output.out) if output.out else None
+
+	return run, calls, status
+
+
+def test_run_preserves_whole_goal_and_configured_budget(invoke):
+	run, calls, _ = invoke
+	goal = 'Keep every requested explanation and example. ' * 100
+	code, result = run(['--url', 'https://example.test/', '--goal', goal, '--input', 'known', '--parent-turns', '3'])
+	assert code == 0 and result['final_answer'] == 'Observed result'
+	assert calls[0][0].goal == goal and calls[0][0].exact_input_values == ['known']
+	assert calls[0][1].parent_turn_budget == 3
+	assert calls[0][1].deadline_seconds == 180 and calls[0][1].max_decisions == 90
+
+
+def test_run_accepts_task_and_rejects_conflicting_arguments(tmp_path, invoke):
+	run, calls, _ = invoke
+	task = workflow.WorkflowTask(
+		id='task',
+		start_url='https://example.test/',
+		goal='Read',
+		required_fields=[{'id': 'answer', 'requirement': 'Observed answer'}],
 	)
-	run = RunResult(
-		run_id='run',
-		directory=str(tmp_path),
-		task=BrowserTask(url=observation.url, goal='Read the result'),
-		budget=RunBudget(max_decisions=5, decisions_used=2, deadline_at=1),
-		status='done',
-		reason='model_done',
-		observation=observation,
-	)
-	result_path = tmp_path / 'result.json'
-	result_path.write_text(run.model_dump_json())
-	(tmp_path / 'journal.jsonl').write_text(json.dumps({'event': 'observed', 'observation': observation.model_dump()}) + '\n')
-	delivery = CompleteDelivery(
-		disposition='complete',
-		browser_summary='Observed result',
-		issues=[],
-		records=[ResultRecord(id='result', value='Applied', quote='Applied result', source_url=observation.url)],
-		final_answer='Applied [source](https://example.test/)',
-	)
-	delivery_path = tmp_path / 'input-delivery.json'
-	delivery_path.write_text(delivery.model_dump_json())
-	return result_path, delivery_path, delivery
+	path = tmp_path / 'task.json'
+	path.write_text(task.model_dump_json())
+	assert run(['--task', str(path)])[0] == 0
+	assert calls[0][0] == task
+	assert run(['--task', str(path), '--goal', 'replacement'])[0] == 2
+	assert len(calls) == 1
 
 
-def test_complete_cli_renders_all_outputs_without_browser_calls(saved_delivery, monkeypatch, capsys):
-	result_path, delivery_path, delivery = saved_delivery
-
-	def forbidden(*args):
-		raise AssertionError('Completion must not execute the browser or call a model')
-
-	monkeypatch.setattr(cli, 'execute', forbidden)
-	monkeypatch.setattr(
-		sys, 'argv', ['bu-fast', 'complete', str(result_path), '--delivery', str(delivery_path), '--required-field', 'result']
-	)
-	before = result_path.read_bytes()
-	with pytest.raises(SystemExit) as exit_info:
-		cli.main()
-	assert exit_info.value.code == 0
-	receipt = json.loads(capsys.readouterr().out)
-	assert receipt['independent_quality_check_pending'] is True
-	assert len(receipt['files']) == 4
-	output = result_path.parent / 'delivery'
-	assert json.loads((output / 'results.json').read_text()) == [r.model_dump() for r in delivery.records]
-	assert (output / 'report.md').read_text().endswith(delivery.final_answer + '\n')
-	assert (output / 'final.txt').read_text() == delivery.final_answer
-	assert result_path.read_bytes() == before
+def test_run_plan_keeps_requirements_and_deduplicates_inputs(tmp_path, invoke):
+	run, calls, _ = invoke
+	path = tmp_path / 'plan.json'
+	path.write_text(json.dumps({'conditions': [{'id': 'a', 'requirement': 'Exact source'}], 'inputs': ['known', 'other']}))
+	assert run(['--url', 'https://example.test/', '--goal', 'Read', '--plan', str(path), '--input', 'known'])[0] == 0
+	assert calls[0][0].exact_input_values == ['known', 'other']
+	assert calls[0][0].required_fields[0].id == 'a'
 
 
-def test_cli_rejects_invented_sources_and_preserves_missing_fields(saved_delivery):
-	result_path, delivery_path, delivery = saved_delivery
-	delivery.records[0].quote = 'Invented evidence'
-	delivery_path.write_text(delivery.model_dump_json())
-	with pytest.raises(ValueError, match='Quote/source'):
-		complete_run(result_path, delivery_path, ['result'])
-	assert not (result_path.parent / 'delivery').exists()
-	delivery.disposition = 'incomplete'
-	delivery.records[0] = ResultRecord(id='result', value=None, quote=None, source_url=None)
-	delivery.issues = ['Result missing']
-	delivery.final_answer = 'The requested result is missing.'
-	delivery_path.write_text(delivery.model_dump_json())
-	receipt = complete_run(result_path, delivery_path, ['result'])
-	assert receipt.disposition == 'incomplete'
-	assert json.loads((result_path.parent / 'delivery/results.json').read_text())[0]['value'] is None
+@pytest.mark.parametrize('outcome', ['incomplete', 'error', 'timeout', 'interrupted'])
+def test_only_complete_outcome_exits_successfully(invoke, outcome):
+	run, _, status = invoke
+	status[0] = outcome
+	code, result = run(['--url', 'https://example.test/', '--goal', 'Read'])
+	assert code == (130 if outcome == 'interrupted' else 2) and result['status'] == outcome
+
+
+@pytest.mark.parametrize(
+	'command', ['run', 'start', 'resume', 'complete', 'evidence', 'review-delivery', 'confirm-fields', 'cited-draft']
+)
+def test_removed_commands_are_rejected(invoke, command):
+	run, calls, _ = invoke
+	assert run([command])[0] == 2
+	assert not calls
+
+
+def test_cli_and_public_python_api_share_defaults(invoke):
+	import browser_use.fast as public
+
+	run, calls, _ = invoke
+	assert run(['--url', 'https://example.test/', '--goal', 'Read'])[0] == 0
+	assert calls[0][1] == public.WorkflowSettings()
+
+
+def test_public_api_exposes_the_adopted_workflow():
+	import browser_use.fast as public
+
+	assert public.run_workflow is workflow.run_workflow
+	assert public.WorkflowTask is workflow.WorkflowTask
+	assert 'DecisionRuntime' not in public.__all__
+
+
+@pytest.mark.parametrize(
+	'arguments',
+	[['--url', 'file:///tmp/data', '--goal', 'Read'], ['--url', 'https://example.test/', '--goal', 'Read', '--timeout', '0']],
+)
+def test_bad_task_or_budget_exits_without_browser_call(invoke, arguments):
+	run, calls, _ = invoke
+	assert run(arguments)[0] == 2
+	assert not calls
+
+
+def test_ctrl_c_reports_interrupted_without_traceback(invoke, monkeypatch):
+	def interrupt(coroutine):
+		coroutine.close()
+		raise KeyboardInterrupt
+
+	monkeypatch.setattr(cli.asyncio, 'run', interrupt)
+	run, _, _ = invoke
+	code, result = run(['--url', 'https://example.test/', '--goal', 'Read'])
+	assert code == 130 and result['status'] == 'interrupted'
