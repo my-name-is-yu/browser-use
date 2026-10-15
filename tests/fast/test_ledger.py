@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from browser_use.fast.exploration import PurposePlan
+from browser_use.fast.exploration import PurposeCondition, PurposePlan
 from browser_use.fast.ledger import (
 	CitedDelivery,
 	CitedRecord,
@@ -141,13 +141,16 @@ def test_missing_field_sharing_a_cited_table_saves_incomplete_without_retry(tmp_
 async def test_completion_checks_multiple_sources_without_rechecking_each_observation(tmp_path):
 	r = runtime(tmp_path, Choices())
 	r.__class__ = LedgerExplorer
-	r.plan = PurposePlan(conditions=[{'id': 'facts', 'requirement': 'Both source facts'}])
+	r.plan = PurposePlan(conditions=[PurposeCondition(id='facts', requirement='Both source facts')])
 	r.sources, r.missing_condition, r.ledger = {}, None, EvidenceLedger()
 	r.result = SimpleNamespace(task=SimpleNamespace(goal='Both source facts'))
 	first = observation().model_copy(update={'text': 'First required fact'})
 	second = observation().model_copy(update={'text': 'Second required fact', 'url': 'https://example.test/second'})
 	await r._decision_context(first)
-	await r._decision_context(second)
+	context = await r._decision_context(second)
+	assert context['purpose_conditions'] == [condition.model_dump() for condition in r.plan.conditions]
+	assert 'requirements' not in context
+	assert context['retained_sources'] and context['observed_input_states']
 	assert len(r.ledger.evidence) == 2
 	assert not r.decisions.calls
 
@@ -174,7 +177,7 @@ def test_shared_table_preserves_csv_cells_and_narrative_without_repeating_table(
 	)
 	delivery = ledger.compile(draft, ['baseline', 'changed'])
 	assert delivery.final_answer.count('Observed conversions') == 1
-	assert all(table.markdown() in r.value for r in delivery.records)
+	assert all(r.value is not None and table.markdown() in r.value for r in delivery.records)
 	assert draft.final_answer in delivery.final_answer
 	from browser_use.fast.delivery import save_delivery
 
@@ -279,7 +282,7 @@ async def test_denied_completion_hands_off_only_when_evidence_is_unchanged(tmp_p
 	choices = Choices('every requested', 'required answer', 'every requested', 'all browser requirements')
 	r = runtime(tmp_path, choices)
 	r.__class__ = LedgerExplorer
-	r.plan = PurposePlan(conditions=[{'id': 'answer', 'requirement': 'Required answer'}])
+	r.plan = PurposePlan(conditions=[PurposeCondition(id='answer', requirement='Required answer')])
 	r.sources, r.missing_condition, r.ledger = {}, None, EvidenceLedger()
 	r.start = AsyncMock(return_value=r)
 	r._build_actions = lambda o, inputs: DecisionRuntime._build_actions(r, o, inputs)

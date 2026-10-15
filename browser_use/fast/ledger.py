@@ -490,7 +490,6 @@ class LedgerExplorer(DecisionRuntime):
 		}
 		query = self.result.task.goal if self.result else ' '.join(c.requirement for c in self.plan.conditions)
 		context['retained_sources'] = self.ledger.packet(self.missing_condition or query, max_characters=18000)
-		context['requirements'] = [c.model_dump() for c in self.plan.conditions]
 		context['observed_input_states'] = self.ledger.input_states().model_dump()
 		return context
 

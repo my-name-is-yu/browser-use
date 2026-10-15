@@ -5,11 +5,15 @@ import json
 from urllib.parse import quote, urljoin, urlparse
 from uuid import uuid4
 
+from cdp_use.cdp.runtime.types import CallArgument
+
 from browser_use.actor.page import Page
+from browser_use.dom.serializer.serializer import DOMTreeSerializer
+from browser_use.dom.views import NodeType
 from browser_use.fast.views import Action, DisplayChange, Observation
 from browser_use.fast.workflow_support import native_selector_element
 
-OBSERVE = r"""(cfg) => {
+OBSERVE = r"""(cfg, ...nodes) => {
 const norm = s => (s || '').replace(/\s+/g, ' ').trim();
 const rendered = e => {if(!e)return false;const r=e.getBoundingClientRect(),s=getComputedStyle(e);
 return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'&&!e.closest('[inert],[aria-hidden="true"]')};
@@ -23,13 +27,14 @@ document.__buTargets?.forEach(e=>e.removeAttribute('data-bu-ref'));document.__bu
 const modal=deep(document,'dialog[open],[role=dialog],[aria-modal=true]').filter(rendered).at(-1);
 const root=modal||document.body||document;
 const state=e=>[e.getAttribute('aria-expanded'),e.getAttribute('aria-selected'),e.getAttribute('aria-pressed'),e.getAttribute('aria-checked'),typeof e.checked==='boolean'?String(e.checked):''].join('|');
-let all=deep(root,'a[href],button,input,textarea,select,summary,[role=button],[role=option],[role=checkbox],[role=tab]').filter(e=>{
-const r=e.getBoundingClientRect();return rendered(e)&&r.right>0&&r.left<innerWidth&&!e.disabled&&e.type!=='hidden'});
+let all=nodes.filter(e=>{
+let scope=e;while(scope&&!root.contains(scope))scope=scope.getRootNode().host;
+const r=e.getBoundingClientRect();return !!scope&&e.isConnected&&rendered(e)&&r.right>0&&r.left<innerWidth&&!e.disabled&&e.type!=='hidden'});
 all.sort((a,b)=>Number(onview(b))-Number(onview(a)));
 const groups=new Map();
 const label=e=>norm(e.getAttribute('aria-label')||e.getAttribute('title')||e.getAttribute('placeholder')||e.innerText||e.getAttribute('name')||[...e.querySelectorAll('img[alt]')].map(x=>x.alt).join(' ')).slice(0,200);
-const targets=all.slice(0,180).map((e,i)=>{
-const ref=cfg.id+'-'+i;e.setAttribute('data-bu-ref',ref);document.__buTargets.set(ref,e);
+const targets=all.slice(0,180).map(e=>{
+const ref=cfg.id+'-'+nodes.indexOf(e);e.setAttribute('data-bu-ref',ref);document.__buTargets.set(ref,e);
 const p=e.closest('form,tr,[role=row],[role=dialog],[data-record-id],li')||e.parentElement||e.getRootNode().host;
 if(!groups.has(p))groups.set(p,'g'+groups.size);
 return {ref,tag:e.tagName.toLowerCase(),type:e.type||'',label:label(e),context:norm(p?.innerText).slice(0,600),href:e.getAttribute('href')||'',value:e.type==='password'?'':e.value||'',group:groups.get(p),state:state(e),options:e.tagName==='SELECT'?[...e.options].filter(o=>!o.disabled).slice(0,240).map(o=>o.value):[],option_labels:e.tagName==='SELECT'?Object.fromEntries([...e.options].filter(o=>!o.disabled).slice(0,240).map(o=>[o.value,norm(o.label)])):{},new_tab:e.getAttribute('target')==='_blank'};
@@ -77,11 +82,65 @@ class BrowserDriver:
 	def __init__(self, page: Page, target_id: str):
 		self.page = page
 		self.target_id = target_id
+		self._target_nodes: dict[str, int] = {}
 
 	async def observe(self, *, screenshot: bool = False) -> Observation:
 		"""Capture current controls and source evidence; screenshots are optional."""
 		config = {'id': uuid4().hex, 'target': self.target_id}
-		observation = Observation.model_validate_json(await self.page.evaluate(OBSERVE, config))
+		dom_service = self.page.dom_service
+		tree, _ = await dom_service.get_dom_tree(target_id=self.target_id)
+		state, _ = DOMTreeSerializer(
+			tree, None, paint_order_filtering=True, session_id=dom_service.browser_session.id
+		).serialize_accessible_elements()
+		# Keep the existing document/shadow-root scope; frame recovery remains a separate operation.
+		nodes = []
+		for node in state.selector_map.values():
+			owner = node
+			while owner.parent_node and owner.node_type != NodeType.DOCUMENT_NODE:
+				owner = owner.parent_node
+			if owner is tree:
+				nodes.append(node)
+		client = dom_service.browser_session.cdp_client
+		session_id = await self.page.session_id
+		# Actor operations need the document requested in the Page's own CDP session.
+		await client.send.DOM.getDocument({'depth': 0, 'pierce': True}, session_id=session_id)
+		# Pass OSS candidates to the evidence snapshot as DOM objects, without enumerating them again.
+		try:
+			resolved = await asyncio.gather(
+				*(
+					client.send.DOM.resolveNode(
+						{'backendNodeId': node.backend_node_id, 'objectGroup': config['id']}, session_id=session_id
+					)
+					for node in nodes
+				),
+				return_exceptions=True,
+			)
+			bindings: list[tuple[int, str]] = []
+			for node, resolved_node in zip(nodes, resolved):
+				if isinstance(resolved_node, BaseException):
+					raise resolved_node
+				if object_id := resolved_node['object'].get('objectId'):
+					bindings.append((node.backend_node_id, object_id))
+			global_object = await client.send.Runtime.evaluate(
+				{'expression': 'globalThis', 'objectGroup': config['id']}, session_id=session_id
+			)
+			global_id = global_object['result'].get('objectId')
+			if not global_id:
+				raise StaleTarget('Document was replaced')
+			arguments: list[CallArgument] = [{'value': config}, *({'objectId': object_id} for _, object_id in bindings)]
+			result = await client.send.Runtime.callFunctionOn(
+				{
+					'functionDeclaration': 'function(cfg, ...nodes) {return (' + OBSERVE + ')(cfg, ...nodes)}',
+					'objectId': global_id,
+					'arguments': arguments,
+					'returnByValue': True,
+				},
+				session_id=session_id,
+			)
+			observation = Observation.model_validate(result['result'].get('value'))
+			self._target_nodes = {config['id'] + '-' + str(i): node_id for i, (node_id, _) in enumerate(bindings)}
+		finally:
+			await client.send.Runtime.releaseObjectGroup({'objectGroup': config['id']}, session_id=session_id)
 		if screenshot:
 			observation.screenshot = await self.page.screenshot()
 		return observation
@@ -184,21 +243,10 @@ return {passed:e.tagName.toLowerCase()===c.tag&&label===c.label&&(e.getAttribute
 				if urlparse(url).scheme in ('http', 'https'):
 					await self.page.goto(url)
 					return
-			client = self.page.dom_service.browser_session.cdp_client
-			session_id = await self.page.session_id
-			await client.send.DOM.getDocument({'depth': 0, 'pierce': True}, session_id=session_id)
-			node = await client.send.Runtime.evaluate(
-				{'expression': 'document.__buTargets?.get(' + json.dumps(action.ref) + ')', 'returnByValue': False},
-				session_id=session_id,
-			)
-			object_id = node.get('result', {}).get('objectId')
-			if not object_id:
-				raise StaleTarget('Target was replaced')
-			try:
-				description = await client.send.DOM.describeNode({'objectId': object_id}, session_id=session_id)
-				element = await self.page.get_element(description['node']['backendNodeId'])
-			finally:
-				await client.send.Runtime.releaseObject({'objectId': object_id}, session_id=session_id)
+			node_id = self._target_nodes.get(action.ref)
+			if node_id is None:
+				raise StaleTarget('Target is not bound to this driver')
+			element = await self.page.get_element(node_id)
 			if action.op == 'fill':
 				await element.fill(action.text)
 				await self.page.evaluate('(c) => document.__buTargets.get(c.ref).focus()', {'ref': action.ref})
