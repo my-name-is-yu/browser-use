@@ -44,11 +44,19 @@ class DeliveryReceipt(Contract):
 	files: list[str]
 
 
+def validate_required_ids(ids: list[str], required_ids: list[str], *, message: str) -> None:
+	"""Require each requested ID exactly once, preserving the caller's error message."""
+	if len(set(ids)) != len(ids) or set(ids) != set(required_ids):
+		raise ValueError(message)
+
+
 def validate_delivery(delivery: CompleteDelivery, required_ids: list[str], evidence: list[dict]) -> None:
 	"""Check field coverage and source quotes without inferring semantic correctness."""
-	ids = [record.id for record in delivery.records]
-	if len(set(ids)) != len(ids) or set(ids) != set(required_ids):
-		raise ValueError('Return each required field exactly once, including missing fields')
+	validate_required_ids(
+		[record.id for record in delivery.records],
+		required_ids,
+		message='Return each required field exactly once, including missing fields',
+	)
 
 	def strings(value):
 		if isinstance(value, str):

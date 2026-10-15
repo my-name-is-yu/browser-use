@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 from pydantic import Field, model_validator
 
-from browser_use.fast.delivery import CompleteDelivery, ResultRecord, SupportingQuote, validate_delivery
+from browser_use.fast.delivery import CompleteDelivery, ResultRecord, SupportingQuote, validate_delivery, validate_required_ids
 from browser_use.fast.exploration import PurposePlan, relevance
 from browser_use.fast.session import POLICY, DecisionRuntime
 from browser_use.fast.views import Action, Choice, ChoiceQuestion, Contract, Observation, Target
@@ -329,9 +329,7 @@ class EvidenceLedger:
 		"""Reject unsupported references; copy exact quotations and render duplicate values."""
 		if draft.disposition == 'continue':
 			raise ValueError('Continue requires more evidence before compiling a terminal delivery')
-		ids = [r.id for r in draft.records]
-		if len(set(ids)) != len(ids) or set(ids) != set(required_ids):
-			raise ValueError('Return each required field exactly once')
+		validate_required_ids([r.id for r in draft.records], required_ids, message='Return each required field exactly once')
 		tables = {table.id: table for table in draft.tables}
 		if len(tables) != len(draft.tables):
 			raise ValueError('Table IDs must be distinct')
