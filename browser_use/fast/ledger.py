@@ -563,5 +563,6 @@ class LedgerExplorer(DecisionRuntime):
 		)
 		self._denied_completion_key = key if self.missing_condition is not None else None
 		self.result.completion_missing_condition = self.missing_condition
-		await self._event('completion_check', decision=answer.model_dump(), missing=self.missing_condition)
+		if self.result.log_directory is not None:
+			await self._event('completion_check', decision=answer.model_dump(), missing=self.missing_condition)
 		return self.missing_condition is None

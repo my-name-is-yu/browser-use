@@ -157,14 +157,17 @@ class DecisionRuntime:
 				assert self.driver and self.decisions
 				r.cdp_url = self.browser.cdp_url
 				r.target_id = self.target_id
-				if repair:
+				if repair and r.log_directory is not None:
 					await self._event('repair_started', deficiency=repair, budget=r.budget.model_dump())
 				if recovery:
 					await self._event(
 						'recovery_receipt',
-						receipt=recovery.model_dump(exclude={'before': {'screenshot'}, 'after': {'screenshot'}}),
+						receipt=recovery.model_dump(exclude={'before': {'screenshot'}, 'after': {'screenshot'}})
+						if r.log_directory is not None
+						else None,
 					)
-					await self._event('observed', observation=recovery.after.model_dump(exclude={'screenshot'}))
+					if r.log_directory is not None:
+						await self._event('observed', observation=recovery.after.model_dump(exclude={'screenshot'}))
 				if not resume and self.navigate_to_start:
 					await self.driver.page.goto(r.task.url)
 					await self._event('navigation', url=r.task.url)
@@ -179,7 +182,8 @@ class DecisionRuntime:
 					if r.history and r.history[-1].status == 'returned' and not r.history[-1].url_after:
 						r.history[-1].url_after = o.url
 						r.history[-1].evidence = (o.fragment_text or o.viewport_text)[:2500]
-					await self._event('observed', observation=o.model_dump(exclude={'screenshot'}))
+					if r.log_directory is not None:
+						await self._event('observed', observation=o.model_dump(exclude={'screenshot'}))
 					context = await self._decision_context(o)
 					if verify_recovery:
 						assert recovery is not None
@@ -260,9 +264,8 @@ class DecisionRuntime:
 					pixels = base64.b64decode(o.screenshot, validate=True)
 					path = Path(r.directory) / f'{o.id}.png'
 					path.write_bytes(pixels)
-					image = {'path': str(path), 'sha256': hashlib.sha256(pixels).hexdigest(), 'bytes': len(pixels)}
 					r.budget.decisions_used += 1
-					await self._event('decision_started', budget=r.budget.model_dump())
+					await self._event('decision_started', budget=r.budget.model_dump() if r.log_directory is not None else None)
 					answer = await self._choose_action(
 						state,
 						question,
@@ -274,7 +277,9 @@ class DecisionRuntime:
 					watch_after_fill = False
 					if answer is None:
 						continue
-					await self._event('decision', question=question.model_dump(), decision=answer.model_dump(), image=image)
+					if r.log_directory is not None:
+						image = {'path': str(path), 'sha256': hashlib.sha256(pixels).hexdigest(), 'bytes': len(pixels)}
+						await self._event('decision', question=question.model_dump(), decision=answer.model_dump(), image=image)
 					action = next((a for a in actions if a.id == answer.answer.choice), None)
 					if action is None:
 						r.status, r.reason = 'blocked', 'decision_refused'
@@ -299,7 +304,7 @@ class DecisionRuntime:
 						target=next((t for t in o.targets if t.ref == action.ref), None),
 					)
 					r.history.append(item)
-					await self._event('dispatch', receipt=item.model_dump())
+					await self._event('dispatch', receipt=item.model_dump() if r.log_directory is not None else None)
 					try:
 						await self.driver.execute(action, o)
 					except StaleTarget as e:
@@ -307,14 +312,14 @@ class DecisionRuntime:
 					except BaseException as e:
 						item.status, item.error = 'unknown', type(e).__name__
 						r.status, r.reason = 'unknown', 'operation_effect_unknown'
-						await self._event('receipt', receipt=item.model_dump())
+						await self._event('receipt', receipt=item.model_dump() if r.log_directory is not None else None)
 						if not isinstance(e, Exception):
 							raise
 						break
 					else:
 						item.status = 'returned'
 						watch_after_fill = action.op == 'fill'
-					await self._event('receipt', receipt=item.model_dump())
+					await self._event('receipt', receipt=item.model_dump() if r.log_directory is not None else None)
 					await asyncio.sleep(0.05)
 				else:
 					r.status, r.reason = 'timeout', 'task_deadline'

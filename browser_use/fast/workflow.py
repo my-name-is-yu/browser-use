@@ -474,12 +474,13 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 						status = 'error'
 						result = {'error': f'{type(e).__name__}: {e}'}
 						metrics.error = result['error']
-					common.record_tool_exchange(
-						log_directory,
-						common.ToolExchange(
-							call_id=call.call_id, name=call.name, arguments=call.arguments, status=status, result=result
-						),
-					)
+					if log_directory is not None:
+						common.record_tool_exchange(
+							log_directory,
+							common.ToolExchange(
+								call_id=call.call_id, name=call.name, arguments=call.arguments, status=status, result=result
+							),
+						)
 					messages.append(
 						{
 							'type': 'function_call_output',
