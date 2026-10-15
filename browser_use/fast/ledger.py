@@ -4,8 +4,10 @@ import csv
 import hashlib
 import io
 import json
+import re
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urldefrag
 
 from pydantic import Field, model_validator
 
@@ -229,7 +231,32 @@ class EvidenceLedger:
 				if not part.strip():
 					continue
 				identity = hashlib.sha256((state + '\0' + url + '\0' + part).encode()).hexdigest()[:20]
-				self.citations[identity] = SourceCitation(id=identity, state=state, url=url, text=part, start=start, end=end)
+				# A document-wide chunk need not belong to the currently visited anchor.
+				# Only a resolved DOM fragment permits falling back to the document URL;
+				# unresolved fragments may be application routes and must stay intact.
+				section = evidence.get('fragment_text', '')
+				source_url = url
+				if section and ' '.join(part.split()) not in ' '.join(section.split()):
+					source_url = urldefrag(url)[0]
+				self.citations[identity] = SourceCitation(
+					id=identity, state=state, url=source_url, text=part, start=start, end=end
+				)
+
+	def render_citation_links(self, content: str) -> str:
+		"""Resolve offered citation URL tokens, rejecting independently copied section URLs."""
+		documents = {urldefrag(c.url)[0] for c in self.citations.values()}
+		for url in re.findall(r'https?://[^\s<>"\]]+', content):
+			document, fragment = urldefrag(url.rstrip(').,;'))
+			if fragment and document in documents:
+				raise ValueError('Use {{source:CITATION_ID}} for source URLs instead of copying or inventing links')
+
+		def replace(match: re.Match[str]) -> str:
+			cid = match.group(1)
+			if cid not in self.offered:
+				raise ValueError('Source citation was not offered from retained browser evidence')
+			return self.citations[cid].url
+
+		return re.sub(r'\{\{source:([^{}]+)\}\}', replace, content)
 
 	def packet(self, query: str, *, max_characters: int = 48000) -> dict:
 		"""Offer relevance-ranked original chunks while retaining every omitted source."""
@@ -357,7 +384,7 @@ class EvidenceLedger:
 			value = (
 				'\n\n'.join(
 					[
-						*([record.value] if record.value is not None else []),
+						*([self.render_citation_links(record.value)] if record.value is not None else []),
 						*[tables[key].markdown() for key in dict.fromkeys(record.table_ids)],
 					]
 				)
@@ -386,7 +413,7 @@ class EvidenceLedger:
 		shown_tables = set()
 		for record, compiled in zip(draft.records, records):
 			if record.value:
-				parts.append(f'{record.value}\n\n[source]({compiled.source_url})')
+				parts.append(f'{self.render_citation_links(record.value)}\n\n[source]({compiled.source_url})')
 			if compiled.value is None:
 				parts.append(f'{record.id}: evidence is missing.')
 			for key in record.table_ids:
@@ -400,7 +427,7 @@ class EvidenceLedger:
 					shown_tables.add(key)
 		answer = '\n\n'.join(parts)
 		if draft.final_answer:
-			answer += '\n\n' + draft.final_answer
+			answer += '\n\n' + self.render_citation_links(draft.final_answer)
 		delivery = CompleteDelivery(
 			disposition=draft.disposition,
 			browser_summary=f'{sum(r.value is not None for r in records)}/{len(records)} cited fields',

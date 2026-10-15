@@ -360,3 +360,30 @@ def test_input_states_keep_pending_and_applied_results_separate():
 		('same31', '31', '87.8 °F', 'https://example.test/?val=31'),
 	]
 	assert len(ledger.evidence) == 4
+
+
+def test_section_citations_do_not_assign_other_sections_to_the_visited_anchor():
+	ledger = EvidenceLedger()
+	observed_url = 'https://example.test/docs#first'
+	ledger.add({'id': 'page', 'url': observed_url, 'text': 'First section. Second section.', 'fragment_text': 'First section.'})
+	packet = ledger.requirement_packet([EvidenceRequirement(id='fact', requirement='section')])
+	citations = {c.text: c for c in ledger.citations.values()}
+	assert ledger.evidence[0]['url'] == observed_url
+	assert citations['First section.'].url == observed_url
+	assert citations['First section. Second section.'].url == 'https://example.test/docs'
+	cid = citations['First section. Second section.'].id
+	assert cid in {c.id for c in packet.citations}
+	content = 'Original quote\n[source]({{source:' + cid + '}})'
+	assert ledger.render_citation_links(content) == 'Original quote\n[source](https://example.test/docs)'
+	for link in ['https://example.test/docs#invented', observed_url]:
+		with pytest.raises(ValueError, match='Use'):
+			ledger.render_citation_links(f'[source]({link})')
+	with pytest.raises(ValueError, match='not offered'):
+		ledger.render_citation_links('{{source:invented}}')
+
+
+def test_unresolved_fragment_routes_are_preserved_in_citations():
+	ledger = EvidenceLedger()
+	url = 'https://example.test/app#/documents/42'
+	ledger.add({'url': url, 'text': 'Document 42', 'fragment_text': ''})
+	assert next(iter(ledger.citations.values())).url == url
