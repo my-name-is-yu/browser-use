@@ -27,6 +27,13 @@ class ResultRecord(Contract):
 	supporting_quotes: list[SupportingQuote] = Field(default_factory=list)
 
 
+class ArtifactReceipt(Contract):
+	"""A required output fulfilled by a successful local file write, not a web quotation."""
+
+	id: str
+	path: str
+
+
 class CompleteDelivery(Contract):
 	"""A single structured judgement, result set and user-facing answer."""
 
@@ -35,6 +42,7 @@ class CompleteDelivery(Contract):
 	records: list[ResultRecord]
 	issues: list[str]
 	final_answer: str
+	artifacts: list[ArtifactReceipt] = Field(default_factory=list)
 
 
 class DeliveryReceipt(Contract):

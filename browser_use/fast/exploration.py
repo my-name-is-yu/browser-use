@@ -1,6 +1,8 @@
 """Validated task requirements and literal ranking of retained source text."""
 
 import re
+from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, model_validator
 
@@ -12,12 +14,29 @@ class PurposeCondition(Contract):
 
 	id: str = Field(min_length=1)
 	requirement: str = Field(min_length=1, max_length=1200)
+	kind: Literal['fact', 'artifact'] = 'fact'
+	path: str | None = None
+
+	@model_validator(mode='after')
+	def validate_artifact(self):
+		"""Only explicitly declared artifacts use file receipts instead of source citations."""
+		if self.kind == 'artifact':
+			if not self.path or not self.path.strip() or self.path == '.':
+				raise ValueError('Artifact requirements need a relative file path')
+			path = Path(self.path)
+			if path.is_absolute() or '..' in path.parts:
+				raise ValueError('Artifact paths must stay inside outputs')
+			if path.as_posix().casefold() in ('report.md', 'results.json'):
+				raise ValueError('Artifact path is reserved for internal outputs')
+		elif self.path is not None:
+			raise ValueError('Only artifact requirements may specify a path')
+		return self
 
 
 class PurposePlan(Contract):
 	"""The parent's initial interpretation and candidate input text."""
 
-	conditions: list[PurposeCondition] = Field(min_length=1, max_length=254)
+	conditions: list[PurposeCondition] = Field(max_length=254)
 	inputs: list[str] = Field(default_factory=list, max_length=20)
 
 	@model_validator(mode='after')

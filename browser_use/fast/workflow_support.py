@@ -175,6 +175,8 @@ def delivered_path(directory: Path, name: str) -> Path:
 	path = root / name
 	if not name or Path(name).is_absolute() or '..' in Path(name).parts or not path.resolve().is_relative_to(root):
 		raise ValueError('Artifact path must stay inside outputs')
+	if path.resolve().relative_to(root).as_posix().casefold() in ('report.md', 'results.json'):
+		raise ValueError('Artifact path is reserved for internal outputs')
 	if path.suffix.lower() not in ('.txt', '.md', '.csv', '.json'):
 		raise ValueError('Supported artifacts are UTF-8 text files')
 	return path

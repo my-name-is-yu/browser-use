@@ -22,6 +22,8 @@ uv run bu-fast --url 'https://対象サイト/' --goal '要求全文'
 
 `--task PATH` では `id`、`start_url`、`goal`、`exact_input_values`、`required_fields` を持つWorkflowTask JSONを指定できます。`required_fields` は `id` と `requirement` の配列です。`--task` と `--url`・`--goal`・`--plan`・`--input` は併用できません。
 
+要件の既定は `kind: "fact"` で、値には取得した原文の引用が必要です。ファイル保存を独立した要件にする場合は `kind: "artifact"` と `path: "exceptions.md"` のような出力先からの相対パスを指定します。`--plan` の条件でも同じ指定を使えます。成果物要件はDecisionsの探索・完了判定には渡さず、親側で実行内の保存成功を検証し、`delivery.json` の `artifacts` に記録します。`records` と `outputs/results.json` は事実の項目だけを保持し、保存通知とリンクはコードが生成します。 出力先直下の `report.md` と `results.json` は内部出力用の予約名のため、artifactには別名を指定してください。事実要件のないartifact単独CSVは、親が `write_artifact` で保存します。
+
 Pythonからは `from browser_use.fast import WorkflowTask, WorkflowSettings, run_workflow` で同じ実行経路を使えます。CLIとPythonの既定値は共通で、総期限は180秒、親要求は24回、Decisions要求は90回です。`--timeout`、`--parent-turns`、`--max-decisions` で変更できます。ブラウザの既定値はBrowser Use本体から引き継ぎ、画面表示は環境変数 `BROWSER_USE_HEADLESS`、未指定ならディスプレイの有無で決まります。`--visible` で表示、`--headless` で非表示を明示し、`--executable-path` でChromeの実行ファイルを指定できます。Pythonでは `WorkflowSettings(browser_profile=BrowserProfile(...))` で本体のブラウザ設定を渡せます。`keep_alive=True` なら終了後もブラウザを残します。`--env-file` の既定は `.env.local`、`--output-dir` の既定は `.bu-fast/workflows` です。
 
 ## 実行経路と保存結果

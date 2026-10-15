@@ -196,6 +196,41 @@ def test_shared_table_preserves_csv_cells_and_narrative_without_repeating_table(
 		CitedTable(id='x', title='x', columns=['x'], rows=[['x', 'y']])
 
 
+def test_all_missing_table_has_its_own_source_without_populating_missing_facts(tmp_path):
+	ledger = EvidenceLedger()
+	ledger.add({'url': 'https://example.test/', 'text': 'For documentation examples.'})
+	cid = ledger.requirement_packet([EvidenceRequirement(id='phone', requirement='phone')]).citations[0].id
+	table = CitedTable(
+		id='contact',
+		title='Contact',
+		columns=['field', 'value', 'source_url'],
+		rows=[['phone', '', '']],
+		csv_path='contact.csv',
+		citation_ids=[cid],
+	)
+	draft = CitedDelivery(
+		disposition='incomplete',
+		records=[CitedRecord(id='phone', value=None, table_ids=['contact'])],
+		tables=[table],
+		issues=['No telephone number is printed.'],
+	)
+	delivery = ledger.compile(draft, ['phone'])
+	assert delivery.records[0].value is None
+	assert delivery.records[0].quote is None and delivery.records[0].source_url is None
+	assert '[source](https://example.test/)' in delivery.final_answer
+	save_tables(draft, tmp_path)
+	assert list(csv.DictReader((tmp_path / 'contact.csv').open())) == [{'field': 'phone', 'value': '', 'source_url': ''}]
+	with pytest.raises(ValueError, match='Missing field'):
+		ledger.compile(draft.model_copy(update={'disposition': 'complete'}), ['phone'])
+	with pytest.raises(ValueError, match='Populated fields'):
+		ledger.compile(
+			draft.model_copy(update={'records': [CitedRecord(id='phone', value='invented', table_ids=['contact'])]}), ['phone']
+		)
+	for citations, message in [(['invented'], 'not offered'), ([cid, cid], 'distinct'), ([], 'referenced by a cited record')]:
+		with pytest.raises(ValueError, match=message):
+			ledger.compile(draft.model_copy(update={'tables': [table.model_copy(update={'citation_ids': citations})]}), ['phone'])
+
+
 def test_table_csv_cannot_escape_output_directory_through_symlink(tmp_path):
 	(tmp_path / 'outside').mkdir()
 	(tmp_path / 'outputs').mkdir()

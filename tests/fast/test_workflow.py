@@ -74,6 +74,7 @@ def harness(tmp_path, monkeypatch):
 			self.options['ledger'].add(item.model_dump(exclude={'screenshot'}))
 			if options.get('resume'):
 				return options['resume'].model_copy(update={'status': 'done', 'reason': 'model_done', 'observation': item})
+			assert task is not None
 			return RunResult(
 				run_id='same-run',
 				directory=str(tmp_path / 'saved'),
@@ -94,6 +95,7 @@ def harness(tmp_path, monkeypatch):
 		step = state.steps.pop(0)
 		if callable(step):
 			step = step(options['input'])
+		assert isinstance(step, tuple)
 		name, arguments = step
 		item = SimpleNamespace(type='function_call', call_id=str(len(state.inputs)), name=name, arguments=json.dumps(arguments))
 		item.model_dump = lambda **kw: {
@@ -139,9 +141,204 @@ async def run_case(tmp_path, **settings):
 		id='source',
 		start_url='https://example.test/',
 		goal='Read the observed source fact',
-		required_fields=[{'id': 'answer', 'requirement': 'Observed source fact'}],
+		required_fields=[workflow.PurposeCondition(id='answer', requirement='Observed source fact')],
 	)
 	return await workflow.run_workflow(task, tmp_path / 'workflow', workflow.WorkflowSettings(**settings))
+
+
+def artifact_task(path='note.md'):
+	return workflow.WorkflowTask(
+		id='artifact',
+		start_url='https://example.test/',
+		goal='Read the source and save it',
+		required_fields=[
+			workflow.PurposeCondition(id='answer', requirement='Observed source fact'),
+			workflow.PurposeCondition(id='file', requirement='Save the requested file', kind='artifact', path=path),
+		],
+	)
+
+
+@pytest.mark.parametrize('path', ['note.md', 'note.csv', 'nested/report.md', 'nested/results.json'])
+async def test_artifact_only_task_keeps_goal_and_verifies_parent_write(tmp_path, harness, path):
+	task = artifact_task(path)
+	task.required_fields = task.required_fields[1:]
+	content = 'value,source_url\nSOURCE FACT,https://example.test/\n' if path.endswith('.csv') else 'SOURCE FACT'
+	harness.steps = [
+		('write_artifact', {'path': path, 'content': content}),
+		('complete_delivery', {'disposition': 'complete', 'records': []}),
+	]
+	result = await workflow.run_workflow(task, tmp_path / 'workflow')
+	assert result.status == 'complete'
+	assert harness.runtime_options['plan'].conditions == []
+	assert harness.calls[0][0].goal == task.goal
+	assert result.delivery is not None and result.delivery.records == []
+	assert result.delivery.artifacts[0].path == path
+	assert (tmp_path / 'workflow/outputs' / path).read_text() == content
+	assert 'write artifact-only CSVs with write_artifact and return records=[] and tables=[]' in harness.inputs[0][0]['content']
+
+
+@pytest.mark.parametrize('path', ['report.md', './report.md', 'REPORT.MD', 'results.json', './RESULTS.JSON'])
+async def test_internal_output_names_cannot_be_requested_or_written(tmp_path, harness, path):
+	with pytest.raises(ValueError, match='reserved for internal outputs'):
+		artifact_task(path)
+	harness.steps = [('write_artifact', {'path': path, 'content': 'REQUESTED CONTENT'})]
+	result = await run_case(tmp_path, parent_turn_budget=1)
+	assert result.status == 'error' and result.delivery is None
+	assert result.error is not None and 'reserved for internal outputs' in result.error
+	assert not (tmp_path / 'workflow/outputs' / path).exists()
+
+
+@pytest.mark.parametrize('attempt_write', [False, True])
+async def test_artifact_only_csv_cannot_complete_without_a_successful_write(tmp_path, harness, monkeypatch, attempt_write):
+	task = artifact_task('note.csv')
+	task.required_fields = task.required_fields[1:]
+	write_text = Path.write_text
+
+	def fail_csv_write(path, *args, **kwargs):
+		if path.name == 'note.csv':
+			raise OSError('disk full')
+		return write_text(path, *args, **kwargs)
+
+	monkeypatch.setattr(Path, 'write_text', fail_csv_write)
+	harness.steps = ([('write_artifact', {'path': 'note.csv', 'content': 'value\nSOURCE FACT\n'})] if attempt_write else []) + [
+		('complete_delivery', {'disposition': 'complete', 'records': []})
+	]
+	result = await workflow.run_workflow(
+		task, tmp_path / 'workflow', workflow.WorkflowSettings(parent_turn_budget=len(harness.steps))
+	)
+	assert result.status == 'error' and result.delivery is None
+	assert result.error is not None and 'Required artifact has not been written' in result.error
+	assert not (tmp_path / 'workflow/outputs/note.csv').exists()
+	assert not (tmp_path / 'workflow/final.txt').exists()
+
+
+@pytest.mark.parametrize('artifact_only', [False, True])
+async def test_artifact_requirements_do_not_reach_decisions_context_or_coverage(tmp_path, harness, artifact_only):
+	from browser_use.fast.ledger import EvidenceLedger, LedgerExplorer
+	from browser_use.fast.views import BrowserTask
+	from tests.fast.test_goal_loop import Choices, observation, runtime
+
+	task = artifact_task()
+	if artifact_only:
+		task.required_fields = task.required_fields[1:]
+	finish = ('complete_delivery', {'disposition': 'complete', 'records': []}) if artifact_only else cited
+	harness.steps = [('write_artifact', {'path': 'note.md', 'content': 'SOURCE FACT'}), finish]
+	await workflow.run_workflow(task, tmp_path / 'workflow')
+	choices = Choices('all browser requirements')
+	explorer = runtime(tmp_path, choices)
+	explorer.__class__ = LedgerExplorer
+	explorer.plan = harness.runtime_options['plan']
+	explorer.sources, explorer.missing_condition, explorer.ledger = {}, None, EvidenceLedger()
+	explorer.result = SimpleNamespace(
+		task=BrowserTask(url='https://example.test/', goal=artifact_task().goal),
+		budget=RunBudget(max_decisions=90, deadline_at=time.time() + 180),
+		history=[],
+		recovery_receipts=[],
+		log_directory=None,
+	)
+	context = await explorer._decision_context(observation())
+	assert [condition['id'] for condition in context['purpose_conditions']] == ([] if artifact_only else ['answer'])
+	assert await explorer._accept_done(observation())
+	if artifact_only:
+		assert choices.calls == []
+	else:
+		assert [choice.value for choice in choices.calls[0][1].choices] == ['COMPLETE', 'answer']
+
+
+@pytest.mark.parametrize('table', [False, True])
+async def test_artifact_receipts_use_successful_writes_not_source_citations(tmp_path, harness, table):
+	def finish(messages):
+		name, draft = cited(messages)
+		if table:
+			draft['records'][0]['table_ids'] = ['data']
+			draft['tables'] = [
+				{'id': 'data', 'title': 'Data', 'columns': ['value'], 'rows': [['SOURCE FACT']], 'csv_path': 'note.csv'}
+			]
+		return name, draft
+
+	harness.steps = ([] if table else [('write_artifact', {'path': 'note.md', 'content': 'SOURCE FACT'})]) + [finish]
+	result = await workflow.run_workflow(artifact_task('note.csv' if table else 'note.md'), tmp_path / 'workflow')
+	assert result.status == 'complete'
+	assert result.delivery is not None
+	assert [record.id for record in result.delivery.records] == ['answer']
+	assert result.delivery.records[0].quote == 'SOURCE FACT'
+	assert result.delivery.artifacts[0].id == 'file'
+	assert [condition.id for condition in harness.runtime_options['plan'].conditions] == ['answer']
+	assert 'Required artifacts: ' in harness.inputs[0][1]['content']
+	assert 'Save the requested file' in harness.inputs[0][1]['content']
+	assert result.delivery.final_answer.endswith(f'Saved [note.{"csv" if table else "md"}](note.{"csv" if table else "md"}).')
+	assert result.delivery.final_answer.count('[source]') == (2 if table else 1)
+	assert (tmp_path / 'workflow/outputs' / result.delivery.artifacts[0].path).is_file()
+	assert result.parent_calls == (1 if table else 2)
+
+
+@pytest.mark.parametrize('preexisting', [False, True])
+async def test_artifact_completion_requires_a_write_receipt(tmp_path, harness, preexisting):
+	def finish(messages):
+		if preexisting:
+			(tmp_path / 'workflow/outputs/note.md').write_text('Not written by the workflow')
+		return cited(messages)
+
+	harness.steps = [finish]
+	result = await workflow.run_workflow(artifact_task(), tmp_path / 'workflow', workflow.WorkflowSettings(parent_turn_budget=1))
+	assert result.status == 'error' and result.delivery is None
+	assert result.error is not None and 'Required artifact has not been written' in result.error
+	assert not (tmp_path / 'workflow/final.txt').exists()
+
+
+async def test_all_missing_csv_with_artifact_requirement_finishes_without_retry(tmp_path, harness):
+	def finish(messages):
+		name, draft = cited(messages)
+		cid = draft['records'][0]['citation_ids'][0]
+		draft.update(disposition='incomplete', issues=['The requested fact is absent.'])
+		draft['records'] = [{'id': 'answer', 'value': None, 'citation_ids': [], 'table_ids': ['data']}]
+		draft['tables'] = [
+			{
+				'id': 'data',
+				'title': 'Missing answer',
+				'columns': ['field', 'value', 'source_url'],
+				'rows': [['answer', '', '']],
+				'csv_path': 'note.csv',
+				'citation_ids': [cid],
+			}
+		]
+		return name, draft
+
+	harness.steps = [finish]
+	result = await workflow.run_workflow(artifact_task('note.csv'), tmp_path / 'workflow')
+	assert result.status == 'incomplete' and result.parent_calls == 1
+	assert result.delivery is not None
+	assert result.delivery.records[0].value is None
+	assert result.delivery.records[0].quote is None and result.delivery.records[0].source_url is None
+	assert result.delivery.artifacts[0].path == 'note.csv'
+	assert (tmp_path / 'workflow/outputs/note.csv').read_text().splitlines() == ['field,value,source_url', 'answer,,']
+
+
+async def test_failed_csv_write_never_completes_artifact_requirement(tmp_path, harness, monkeypatch):
+	def finish(messages):
+		name, draft = cited(messages)
+		draft['records'][0]['table_ids'] = ['data']
+		draft['tables'] = [
+			{'id': 'data', 'title': 'Data', 'columns': ['value'], 'rows': [['SOURCE FACT']], 'csv_path': 'note.csv'}
+		]
+		return name, draft
+
+	harness.steps = [finish]
+	monkeypatch.setattr(workflow, 'save_tables', lambda *a: (_ for _ in ()).throw(OSError('disk full')))
+	result = await workflow.run_workflow(
+		artifact_task('note.csv'), tmp_path / 'workflow', workflow.WorkflowSettings(parent_turn_budget=1)
+	)
+	assert result.status == 'error' and result.delivery is None
+	assert result.error is not None and 'disk full' in result.error
+	assert not (tmp_path / 'workflow/final.txt').exists()
+
+
+@pytest.mark.parametrize(
+	'kind,path', [('artifact', None), ('artifact', '../escape.md'), ('artifact', '/tmp/escape.md'), ('fact', 'note.md')]
+)
+def test_artifact_requirements_are_explicit_and_confined(kind, path):
+	with pytest.raises(ValueError):
+		workflow.PurposeCondition(id='field', requirement='Required outcome', kind=kind, path=path)
 
 
 async def test_browser_inherits_upstream_environment_and_profile_defaults(tmp_path, harness, monkeypatch):
@@ -391,7 +588,10 @@ async def test_shared_table_missing_field_saves_once_without_fabricated_value(tm
 		id='contact',
 		start_url='https://example.test/',
 		goal='Find fact and phone',
-		required_fields=[{'id': 'answer', 'requirement': 'Source fact'}, {'id': 'phone', 'requirement': 'Phone, null if absent'}],
+		required_fields=[
+			workflow.PurposeCondition(id='answer', requirement='Source fact'),
+			workflow.PurposeCondition(id='phone', requirement='Phone, null if absent'),
+		],
 	)
 	result = await workflow.run_workflow(task, tmp_path / 'workflow', workflow.WorkflowSettings(parent_turn_budget=1))
 	assert (result.delivery is not None) and result.parent_calls == 1
@@ -406,7 +606,8 @@ async def test_shared_table_missing_field_saves_once_without_fabricated_value(tm
 async def test_unvalidated_attempt_never_becomes_final_output(tmp_path, harness, save_logs):
 	harness.steps = [lambda m: cited(m, forged=True)]
 	result = await run_case(tmp_path, parent_turn_budget=1, log_dir=tmp_path / 'logs' if save_logs else None)
-	assert result.status == 'error' and result.delivery is None and 'not offered' in result.error
+	assert result.status == 'error' and result.delivery is None
+	assert result.error is not None and 'not offered' in result.error
 	directory = tmp_path / 'workflow'
 	assert (tmp_path / 'logs/workflow/attempted-delivery-00.json').exists() is save_logs
 	assert not (directory / 'final.txt').exists() and not (directory / 'delivery.json').exists()
@@ -417,7 +618,8 @@ async def test_file_save_failure_is_not_completion(tmp_path, harness, monkeypatc
 	harness.steps = [cited]
 	monkeypatch.setattr(workflow, 'save_delivery', lambda *a: (_ for _ in ()).throw(OSError('disk full')))
 	result = await run_case(tmp_path, parent_turn_budget=1)
-	assert result.status == 'error' and result.delivery is None and 'disk full' in result.error
+	assert result.status == 'error' and result.delivery is None
+	assert result.error is not None and 'disk full' in result.error
 	assert not (tmp_path / 'workflow/final.txt').exists()
 
 
@@ -425,7 +627,7 @@ async def test_cleanup_error_releases_other_resources_and_reports_failure(tmp_pa
 	harness.steps = [cited]
 	harness.parent_close.side_effect = RuntimeError('close failed')
 	result = await run_case(tmp_path)
-	assert result.status == 'error' and 'Cleanup failed' in result.error
+	assert result.status == 'error' and result.error is not None and 'Cleanup failed' in result.error
 	harness.browser.kill.assert_awaited_once()
 	harness.decision_close.assert_awaited_once()
 	assert result.delivery is not None
@@ -448,7 +650,7 @@ def test_task_supports_more_than_eight_requirements_and_validates_url():
 		id='many',
 		start_url='https://example.test/',
 		goal='Read all facts',
-		required_fields=[{'id': str(i), 'requirement': f'Fact {i}'} for i in range(9)],
+		required_fields=[workflow.PurposeCondition(id=str(i), requirement=f'Fact {i}') for i in range(9)],
 	)
 	assert len(task.required_fields) == 9
 	with pytest.raises(ValueError, match='HTTP'):

@@ -7,7 +7,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Literal, cast
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 from openai import AsyncOpenAI
@@ -20,7 +20,7 @@ from browser_use.browser.profile import BrowserProfile
 from browser_use.browser.session import BrowserSession
 from browser_use.fast import workflow_support as common
 from browser_use.fast.decisions import DecisionClient
-from browser_use.fast.delivery import CompleteDelivery, save_delivery
+from browser_use.fast.delivery import ArtifactReceipt, CompleteDelivery, save_delivery
 from browser_use.fast.driver import BrowserDriver
 from browser_use.fast.exploration import PurposeCondition, PurposePlan
 from browser_use.fast.ledger import (
@@ -39,7 +39,9 @@ The browser starts on the supplied URL. Decisions explores the goal; when it nee
 Retained source citations are attached automatically. Resolve citation.text_ref and link_group.context_ref through texts in current or earlier packets. Citation IDs preserve source URL and observation state; link groups preserve links observed together. Never combine different input/output states. A filled field or matching title alone is not success. DONE and requirement retrieval candidates are provisional, not a quality verdict.
 Use read_retained_evidence with the missing requirement or source terms before reacquiring evidence or reporting it missing. Presentation truncation does not prove acquisition failure.
 Use complete_delivery with disposition, records, tables, issues and final_answer. Each record contains id, value, citation_ids and table_ids. Select only offered citation IDs; code copies exact quotes and URLs. Return every required field once. Missing fields have value null and no citation_ids; choose incomplete and explain the gap. continue keeps the session open for more evidence or recovery.
-Generate each requested fact once in record.value. For tabular results generate cells once in tables (id, title, columns, rows, csv_path), reference them with records.table_ids and cite the source IDs. A cited record may have null value when its table contains the requested content. Code renders each table once and writes the CSV from those cells. Missing records may reference shared tables without claiming evidence. Never repeat table cells in values, final_answer or write_artifact.
+Required artifacts are separate from required factual fields: do not put artifact requirements or save notifications in records or final_answer. Write requested text files with write_artifact. For CSVs associated with required factual fields, use tables.csv_path. When there are no required factual fields, write artifact-only CSVs with write_artifact and return records=[] and tables=[]. Code verifies successful writes and adds artifact receipts and links. The output-root names report.md and results.json are reserved for internal outputs; use other paths for requested artifacts.
+Generate each requested fact once in record.value. For tabular results supporting required factual fields, generate cells once in tables (id, title, columns, rows, csv_path), reference them with records.table_ids and cite the source IDs. A cited record may have null value when its table contains the requested content. Code renders each table once and writes the CSV from those cells. Missing records may reference shared tables without claiming evidence. Never repeat table cells in values, final_answer or write_artifact.
+Tables may have their own citation_ids for the inspected sources, including a table whose requested facts are all missing. Keep missing records null with no citation_ids; put source citations on the table instead. Table citations never replace citations for populated factual records.
 Code renders records and tables as the final answer. final_answer is only additional requested explanation or analysis; leave it empty when the records suffice. Preserve all requested files, columns, rows, links, examples and constraints. write_artifact saves other requested text files; supplemental results.json and report.md do not replace user-requested files."""
 
 
@@ -159,6 +161,8 @@ class WorkflowTask(Contract):
 async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSettings | None = None) -> WorkflowResult:
 	"""Run the adopted browser, evidence and cited-delivery path with one shared budget."""
 	task_data = task.model_dump()
+	factual_fields = [field for field in task.required_fields if field.kind == 'fact']
+	artifact_fields = [field for field in task.required_fields if field.kind == 'artifact']
 	began = time.monotonic()
 	settings = settings or WorkflowSettings()
 	directory.mkdir(parents=True)
@@ -193,6 +197,7 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 		deadline = began + settings.deadline_seconds
 		native_dispatch_inflight = False
 		shared_ledger = EvidenceLedger()
+		written_artifacts: set[Path] = set()
 		parent_citations_sent = set()
 		parent_texts_sent = set()
 
@@ -239,7 +244,7 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 				max_decisions=settings.max_decisions,
 				output_dir=runtime_directory / 'runs',
 				log_dir=log_directory / 'runs' if log_directory is not None else None,
-				plan=PurposePlan(conditions=task_data['required_fields']),
+				plan=PurposePlan(conditions=factual_fields),
 				ledger=shared_ledger,
 				navigate_to_start=not attached,
 			)
@@ -259,7 +264,8 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 					'content': task_data['goal']
 					+ '\nRequired outputs: results.json and report.md. Known exact input values: '
 					+ json.dumps(task_data['exact_input_values'])
-					+ ('\nRequired fields: ' + json.dumps(task_data['required_fields'])),
+					+ ('\nRequired fields: ' + json.dumps([field.model_dump() for field in factual_fields]))
+					+ ('\nRequired artifacts: ' + json.dumps([field.model_dump() for field in artifact_fields])),
 				},
 				{'role': 'user', 'content': json.dumps(initial, ensure_ascii=False)},
 			]
@@ -275,7 +281,7 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 				)
 				metrics.parent_calls += 1
 				packet = shared_ledger.requirement_packet(
-					[EvidenceRequirement.model_validate(f) for f in task_data['required_fields']]
+					[EvidenceRequirement(id=field.id, requirement=field.requirement) for field in factual_fields]
 				).model_dump()
 				packet['citations'] = [c for c in packet['citations'] if c['id'] not in parent_citations_sent]
 				packet['texts'] = {key: text for key, text in packet['texts'].items() if key not in parent_texts_sent}
@@ -317,9 +323,26 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 						draft = CitedDelivery.model_validate_json(call.arguments)
 						if draft.disposition == 'continue':
 							return {'continue': True, 'issues': draft.issues}
-						data = shared_ledger.compile(draft, [f['id'] for f in task_data['required_fields']])
-						save_tables(draft, directory / 'outputs')
+						outputs = directory / 'outputs'
+						artifacts = [ArtifactReceipt(id=field.id, path=field.path) for field in artifact_fields if field.path]
+						artifact_paths = [common.delivered_path(outputs, artifact.path) for artifact in artifacts]
+						planned_paths = {
+							common.delivered_path(outputs, table.csv_path) for table in draft.tables if table.csv_path
+						}
+						for path in artifact_paths:
+							if path.resolve() not in written_artifacts | {p.resolve() for p in planned_paths}:
+								raise ValueError(f'Required artifact has not been written: {path.name}')
+						links = '\n\n'.join(f'Saved [{artifact.path}]({quote(artifact.path)}).' for artifact in artifacts)
+						compiled_draft = draft.model_copy(
+							update={'final_answer': '\n\n'.join(part for part in (draft.final_answer, links) if part)}
+						)
+						data = shared_ledger.compile(compiled_draft, [field.id for field in factual_fields])
+						written_artifacts.update(path.resolve() for path in save_tables(draft, outputs))
+						data.artifacts = artifacts
 						receipt = save_delivery(data, directory / 'outputs')
+						for path in artifact_paths:
+							if not path.is_file():
+								raise ValueError(f'Required artifact is missing: {path.name}')
 						(directory / 'final.txt').write_text(data.final_answer)
 						(directory / 'delivery.json').write_text(data.model_dump_json())
 						metrics.delivery = data
@@ -347,6 +370,7 @@ async def run_workflow(task: WorkflowTask, directory: Path, settings: WorkflowSe
 						path = common.delivered_path(directory / 'outputs', data.path)
 						path.parent.mkdir(parents=True, exist_ok=True)
 						path.write_text(data.content)
+						written_artifacts.add(path.resolve())
 						return {'written': data.path, 'bytes': path.stat().st_size}
 					if call.name != 'browser_batch':
 						raise ValueError('Unknown tool')

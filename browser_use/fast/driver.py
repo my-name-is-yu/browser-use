@@ -22,7 +22,7 @@ const rootsOf=root=>{const roots=[root];for(let i=0;i<roots.length;i++)for(const
 const deep=(root,selector)=>rootsOf(root).flatMap(r=>[...r.querySelectorAll(selector)]);
 const textOf=root=>rootsOf(root).map(r=>r.innerText??[...r.children].filter(rendered).map(e=>e.innerText||'').join('\n')).join('\n');
 document.__buFocused=()=>{let e=document.activeElement;while(e?.shadowRoot?.activeElement)e=e.shadowRoot.activeElement;return e};
-document.__buDocument ||= crypto.randomUUID();
+document.__buDocument ||= cfg.id;
 document.__buTargets?.forEach(e=>e.removeAttribute('data-bu-ref'));document.__buTargets=new Map();
 const modal=deep(document,'dialog[open],[role=dialog],[aria-modal=true]').filter(rendered).at(-1);
 const root=modal||document.body||document;
@@ -124,6 +124,8 @@ class BrowserDriver:
 			global_object = await client.send.Runtime.evaluate(
 				{'expression': 'globalThis', 'objectGroup': config['id']}, session_id=session_id
 			)
+			if 'exceptionDetails' in global_object:
+				raise RuntimeError(f'Observation JavaScript failed: {global_object["exceptionDetails"]}')
 			global_id = global_object['result'].get('objectId')
 			if not global_id:
 				raise StaleTarget('Document was replaced')
@@ -137,7 +139,12 @@ class BrowserDriver:
 				},
 				session_id=session_id,
 			)
-			observation = Observation.model_validate(result['result'].get('value'))
+			if 'exceptionDetails' in result:
+				raise RuntimeError(f'Observation JavaScript failed: {result["exceptionDetails"]}')
+			value = result['result'].get('value')
+			if value is None:
+				raise RuntimeError('Observation JavaScript returned no value')
+			observation = Observation.model_validate(value)
 			self._target_nodes = {config['id'] + '-' + str(i): node_id for i, (node_id, _) in enumerate(bindings)}
 		finally:
 			await client.send.Runtime.releaseObjectGroup({'objectGroup': config['id']}, session_id=session_id)

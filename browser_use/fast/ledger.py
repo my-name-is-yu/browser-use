@@ -41,6 +41,7 @@ class CitedTable(Contract):
 	columns: list[str] = Field(min_length=1)
 	rows: list[list[str]] = Field(min_length=1)
 	csv_path: str | None = None
+	citation_ids: list[str] = Field(default_factory=list)
 
 	@model_validator(mode='after')
 	def validate_table(self):
@@ -335,7 +336,14 @@ class EvidenceLedger:
 			raise ValueError('Table IDs must be distinct')
 		if {key for r in draft.records for key in r.table_ids} != set(tables):
 			raise ValueError('Every table must be referenced by a required record, with no unknown table IDs')
-		if {key for r in draft.records if r.citation_ids for key in r.table_ids} != set(tables):
+		for table in draft.tables:
+			if len(set(table.citation_ids)) != len(table.citation_ids):
+				raise ValueError('Table citation IDs must be distinct')
+			if any(cid not in self.offered for cid in table.citation_ids):
+				raise ValueError('Table citation was not offered from retained browser evidence')
+		if {key for r in draft.records if r.citation_ids for key in r.table_ids} | {
+			table.id for table in draft.tables if table.citation_ids
+		} != set(tables):
 			raise ValueError('Every table must be referenced by a cited record')
 		csv_paths = [table.csv_path for table in draft.tables if table.csv_path is not None]
 		if len(csv_paths) != len(set(csv_paths)):
@@ -383,9 +391,11 @@ class EvidenceLedger:
 				parts.append(f'{record.id}: evidence is missing.')
 			for key in record.table_ids:
 				if key not in shown_tables:
-					urls = dict.fromkeys(
-						self.citations[cid].url for r in draft.records if key in r.table_ids for cid in r.citation_ids
-					)
+					citation_ids = [
+						*tables[key].citation_ids,
+						*(cid for r in draft.records if key in r.table_ids for cid in r.citation_ids),
+					]
+					urls = dict.fromkeys(self.citations[cid].url for cid in citation_ids)
 					parts.append(tables[key].markdown() + '\n\n' + ' '.join(f'[source]({url})' for url in urls))
 					shown_tables.add(key)
 		answer = '\n\n'.join(parts)
@@ -530,6 +540,8 @@ class LedgerExplorer(DecisionRuntime):
 
 		assert self.result and self.decisions
 		self._completion_stalled = False
+		if not self.plan.conditions:
+			return True
 		key = self._completion_evidence_key(observation)
 		if key == getattr(self, '_denied_completion_key', None):
 			self._completion_stalled = True

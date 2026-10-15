@@ -34,8 +34,8 @@ async def test_target_operations_use_the_observed_backend_node_and_reject_change
 	page.get_element.assert_not_awaited()
 
 
-@pytest.mark.parametrize('capture_fails', [False, True])
-async def test_observation_uses_oss_candidates_for_the_requested_tab_and_releases_objects(monkeypatch, capture_fails):
+@pytest.mark.parametrize('failure', [None, 'python', 'javascript', 'missing', 'global'])
+async def test_observation_uses_oss_candidates_for_the_requested_tab_and_releases_objects(monkeypatch, failure):
 	tree = SimpleNamespace(parent_node=None, node_type=NodeType.DOCUMENT_NODE)
 	node = SimpleNamespace(backend_node_id=73, parent_node=tree, node_type=NodeType.ELEMENT_NODE)
 	frame_document = SimpleNamespace(parent_node=tree, node_type=NodeType.DOCUMENT_NODE)
@@ -46,8 +46,12 @@ async def test_observation_uses_oss_candidates_for_the_requested_tab_and_release
 	monkeypatch.setattr('browser_use.fast.driver.DOMTreeSerializer', lambda *args, **kwargs: serializer)
 
 	async def snapshot(params, **kwargs):
-		if capture_fails:
+		if failure == 'python':
 			raise RuntimeError('Document navigated')
+		if failure == 'javascript':
+			return {'result': {'type': 'object'}, 'exceptionDetails': {'text': 'snapshot failed'}}
+		if failure == 'missing':
+			return {'result': {'type': 'undefined'}}
 		config = params['arguments'][0]['value']
 		assert params['arguments'][1:] == [{'objectId': 'oss-node'}]
 		o = observation()
@@ -61,7 +65,11 @@ async def test_observation_uses_oss_candidates_for_the_requested_tab_and_release
 		send=SimpleNamespace(
 			DOM=SimpleNamespace(resolveNode=resolve, getDocument=AsyncMock()),
 			Runtime=SimpleNamespace(
-				evaluate=AsyncMock(return_value={'result': {'objectId': 'window'}}),
+				evaluate=AsyncMock(
+					return_value={'result': {}, 'exceptionDetails': {'text': 'global failed'}}
+					if failure == 'global'
+					else {'result': {'objectId': 'window'}}
+				),
 				callFunctionOn=AsyncMock(side_effect=snapshot),
 				releaseObjectGroup=release,
 			),
@@ -76,8 +84,14 @@ async def test_observation_uses_oss_candidates_for_the_requested_tab_and_release
 
 	page = SimpleNamespace(dom_service=dom, session_id=session_id())
 	driver = BrowserDriver(cast(Any, page), 'tab')
-	if capture_fails:
-		with pytest.raises(RuntimeError, match='Document navigated'):
+	if failure:
+		message = {
+			'python': 'Document navigated',
+			'javascript': 'Observation JavaScript failed.*snapshot failed',
+			'missing': 'Observation JavaScript returned no value',
+			'global': 'Observation JavaScript failed.*global failed',
+		}[failure]
+		with pytest.raises(RuntimeError, match=message):
 			await driver.observe()
 	else:
 		o = await driver.observe()
